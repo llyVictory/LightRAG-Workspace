@@ -11,7 +11,7 @@ DEFAULT_WOKERS = 2
 DEFAULT_MAX_GRAPH_NODES = 1000
 
 # Default values for extraction settings
-DEFAULT_SUMMARY_LANGUAGE = "English"  # Default language for document processing
+DEFAULT_SUMMARY_LANGUAGE = "Simplified Chinese"  # Default language for document processing
 DEFAULT_MAX_GLEANING = 1
 DEFAULT_ENTITY_NAME_MAX_LENGTH = 256
 
@@ -24,19 +24,35 @@ DEFAULT_SUMMARY_LENGTH_RECOMMENDED = 600
 # Maximum token size sent to LLM for summary
 DEFAULT_SUMMARY_CONTEXT_SIZE = 12000
 # Default entities to extract if ENTITY_TYPES is not specified in .env
+# DEFAULT_ENTITY_TYPES = [
+#     "Person",
+#     "Creature",
+#     "Organization",
+#     "Location",
+#     "Event",
+#     "Concept",
+#     "Method",
+#     "Content",
+#     "Data",
+#     "Artifact",
+#     "NaturalObject",
+# ]
+
+
 DEFAULT_ENTITY_TYPES = [
-    "Person",
-    "Creature",
-    "Organization",
-    "Location",
-    "Event",
-    "Concept",
-    "Method",
-    "Content",
-    "Data",
-    "Artifact",
-    "NaturalObject",
+    "人物",          # Person
+    "生物",          # Creature
+    "组织",          # Organization
+    "地点",          # Location
+    "事件",          # Event
+    "概念",          # Concept
+    "方法",          # Method
+    "内容",          # Content
+    "数据",          # Data
+    "人工制品",      # Artifact
+    "自然物",        # NaturalObject
 ]
+
 
 # Separator for: description, source_id and relation-key fields(Can not be changed after data inserted)
 GRAPH_FIELD_SEP = "<SEP>"
