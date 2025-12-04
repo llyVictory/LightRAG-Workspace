@@ -2,8 +2,8 @@ import asyncio
 import base64
 import os
 import zlib
-from typing import Any, final
-from dataclasses import dataclass
+from typing import Any, final, Dict
+from dataclasses import dataclass, field
 import numpy as np
 import time
 
@@ -20,15 +20,23 @@ from .shared_storage import (
     set_all_update_flags,
 )
 
+# 1. 定义状态容器，存放每个 Workspace 独有的 Client 和文件路径
+@dataclass
+class NanoDBWorkspaceState:
+    client: NanoVectorDB
+    client_file_name: str
+    storage_lock: Any
+    storage_updated: Any
 
 @final
 @dataclass
 class NanoVectorDBStorage(BaseVectorStorage):
+    # 2. 状态缓存池
+    _states: Dict[str, NanoDBWorkspaceState] = field(default_factory=dict, init=False)
+
     def __post_init__(self):
         # Initialize basic attributes
-        self._client = None
-        self._storage_lock = None
-        self.storage_updated = None
+        self._states = {} # 初始化缓存
 
         # Use global config value if specified, otherwise use default
         kwargs = self.global_config.get("vector_db_storage_cls_kwargs", {})
@@ -39,58 +47,80 @@ class NanoVectorDBStorage(BaseVectorStorage):
             )
         self.cosine_better_than_threshold = cosine_threshold
 
-        working_dir = self.global_config["working_dir"]
-        if self.workspace:
-            # Include workspace in the file path for data isolation
-            workspace_dir = os.path.join(working_dir, self.workspace)
-            self.final_namespace = f"{self.workspace}_{self.namespace}"
+        # 保存根目录配置，不再计算具体路径
+        self.working_dir = self.global_config["working_dir"]
+        self._max_batch_size = self.global_config["embedding_batch_num"]
+
+    # 3. 核心：动态加载当前 Workspace 的状态
+    async def _get_current_state(self) -> NanoDBWorkspaceState:
+        current_ws = self.workspace
+
+        if current_ws in self._states:
+            return self._states[current_ws]
+
+        # --- 初始化路径 ---
+        if current_ws:
+            workspace_dir = os.path.join(self.working_dir, current_ws)
         else:
-            # Default behavior when workspace is empty
-            self.final_namespace = self.namespace
-            self.workspace = ""
-            workspace_dir = working_dir
+            workspace_dir = self.working_dir
 
         os.makedirs(workspace_dir, exist_ok=True)
-        self._client_file_name = os.path.join(
+        client_file_name = os.path.join(
             workspace_dir, f"vdb_{self.namespace}.json"
         )
 
-        self._max_batch_size = self.global_config["embedding_batch_num"]
-
-        self._client = NanoVectorDB(
-            self.embedding_func.embedding_dim,
-            storage_file=self._client_file_name,
+        # --- 初始化锁和更新标志 ---
+        storage_updated = await get_update_flag(
+            self.namespace, workspace=current_ws
         )
+        storage_lock = get_namespace_lock(
+            self.namespace, workspace=current_ws
+        )
+
+        # --- 初始化 Client ---
+        client = NanoVectorDB(
+            self.embedding_func.embedding_dim,
+            storage_file=client_file_name,
+        )
+
+        # --- 创建并缓存状态 ---
+        state = NanoDBWorkspaceState(
+            client=client,
+            client_file_name=client_file_name,
+            storage_lock=storage_lock,
+            storage_updated=storage_updated
+        )
+        self._states[current_ws] = state
+        return state
 
     async def initialize(self):
-        """Initialize storage data"""
-        # Get the update flag for cross-process update notification
-        self.storage_updated = await get_update_flag(
-            self.namespace, workspace=self.workspace
-        )
-        # Get the storage lock for use in other methods
-        self._storage_lock = get_namespace_lock(
-            self.namespace, workspace=self.workspace
-        )
+        """Initialize storage data (Warm-up default workspace)"""
+        await self._get_current_state()
 
-    async def _get_client(self):
-        """Check if the storage should be reloaded"""
+    async def _get_client(self) -> NanoVectorDB:
+        """
+        Get the client for the CURRENT workspace.
+        Also checks if the storage should be reloaded (cross-process sync).
+        """
+        # 获取当前 workspace 的状态
+        state = await self._get_current_state()
+
         # Acquire lock to prevent concurrent read and write
-        async with self._storage_lock:
+        async with state.storage_lock:
             # Check if data needs to be reloaded
-            if self.storage_updated.value:
+            if state.storage_updated.value:
                 logger.info(
                     f"[{self.workspace}] Process {os.getpid()} reloading {self.namespace} due to update by another process"
                 )
-                # Reload data
-                self._client = NanoVectorDB(
+                # Reload data by re-initializing NanoVectorDB with the same file
+                state.client = NanoVectorDB(
                     self.embedding_func.embedding_dim,
-                    storage_file=self._client_file_name,
+                    storage_file=state.client_file_name,
                 )
                 # Reset update flag
-                self.storage_updated.value = False
+                state.storage_updated.value = False
 
-            return self._client
+            return state.client
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
         """
@@ -131,6 +161,8 @@ class NanoVectorDBStorage(BaseVectorStorage):
                 encoded_vector = base64.b64encode(compressed_vector).decode("utf-8")
                 d["vector"] = encoded_vector
                 d["__vector__"] = embeddings[i]
+
+            # [修改] 使用 _get_client 获取当前 Workspace 的实例
             client = await self._get_client()
             results = client.upsert(datas=list_data)
             return results
@@ -141,7 +173,7 @@ class NanoVectorDBStorage(BaseVectorStorage):
             )
 
     async def query(
-        self, query: str, top_k: int, query_embedding: list[float] = None
+            self, query: str, top_k: int, query_embedding: list[float] = None
     ) -> list[dict[str, Any]]:
         # Use provided embedding or compute it
         if query_embedding is not None:
@@ -153,6 +185,7 @@ class NanoVectorDBStorage(BaseVectorStorage):
             )  # higher priority for query
             embedding = embedding[0]
 
+        # [修改] 使用 _get_client 获取当前 Workspace 的实例
         client = await self._get_client()
         results = client.query(
             query=embedding,
@@ -176,16 +209,7 @@ class NanoVectorDBStorage(BaseVectorStorage):
         return getattr(client, "_NanoVectorDB__storage")
 
     async def delete(self, ids: list[str]):
-        """Delete vectors with specified IDs
-
-        Importance notes:
-        1. Changes will be persisted to disk during the next index_done_callback
-        2. Only one process should updating the storage at a time before index_done_callback,
-           KG-storage-log should be used to avoid data corruption
-
-        Args:
-            ids: List of vector IDs to be deleted
-        """
+        """Delete vectors with specified IDs"""
         try:
             client = await self._get_client()
             # Record count before deletion
@@ -206,13 +230,6 @@ class NanoVectorDBStorage(BaseVectorStorage):
             )
 
     async def delete_entity(self, entity_name: str) -> None:
-        """
-        Importance notes:
-        1. Changes will be persisted to disk during the next index_done_callback
-        2. Only one process should updating the storage at a time before index_done_callback,
-           KG-storage-log should be used to avoid data corruption
-        """
-
         try:
             entity_id = compute_mdhash_id(entity_name, prefix="ent-")
             logger.debug(
@@ -234,13 +251,6 @@ class NanoVectorDBStorage(BaseVectorStorage):
             logger.error(f"[{self.workspace}] Error deleting entity {entity_name}: {e}")
 
     async def delete_entity_relation(self, entity_name: str) -> None:
-        """
-        Importance notes:
-        1. Changes will be persisted to disk during the next index_done_callback
-        2. Only one process should updating the storage at a time before index_done_callback,
-           KG-storage-log should be used to avoid data corruption
-        """
-
         try:
             client = await self._get_client()
             storage = getattr(client, "_NanoVectorDB__storage")
@@ -255,7 +265,7 @@ class NanoVectorDBStorage(BaseVectorStorage):
             ids_to_delete = [relation["__id__"] for relation in relations]
 
             if ids_to_delete:
-                client = await self._get_client()
+                # client 已经获取，直接使用
                 client.delete(ids_to_delete)
                 logger.debug(
                     f"[{self.workspace}] Deleted {len(ids_to_delete)} relations for {entity_name}"
@@ -270,31 +280,33 @@ class NanoVectorDBStorage(BaseVectorStorage):
             )
 
     async def index_done_callback(self) -> bool:
-        """Save data to disk"""
-        async with self._storage_lock:
+        """Save data to disk for the CURRENT workspace"""
+        state = await self._get_current_state()
+
+        async with state.storage_lock:
             # Check if storage was updated by another process
-            if self.storage_updated.value:
+            if state.storage_updated.value:
                 # Storage was updated by another process, reload data instead of saving
                 logger.warning(
                     f"[{self.workspace}] Storage for {self.namespace} was updated by another process, reloading..."
                 )
-                self._client = NanoVectorDB(
+                state.client = NanoVectorDB(
                     self.embedding_func.embedding_dim,
-                    storage_file=self._client_file_name,
+                    storage_file=state.client_file_name,
                 )
                 # Reset update flag
-                self.storage_updated.value = False
+                state.storage_updated.value = False
                 return False  # Return error
 
         # Acquire lock and perform persistence
-        async with self._storage_lock:
+        async with state.storage_lock:
             try:
                 # Save data to disk
-                self._client.save()
+                state.client.save()
                 # Notify other processes that data has been updated
                 await set_all_update_flags(self.namespace, workspace=self.workspace)
                 # Reset own update flag to avoid self-reloading
-                self.storage_updated.value = False
+                state.storage_updated.value = False
                 return True  # Return success
             except Exception as e:
                 logger.error(
@@ -305,14 +317,6 @@ class NanoVectorDBStorage(BaseVectorStorage):
         return True  # Return success
 
     async def get_by_id(self, id: str) -> dict[str, Any] | None:
-        """Get vector data by its ID
-
-        Args:
-            id: The unique identifier of the vector
-
-        Returns:
-            The vector data if found, or None if not found
-        """
         client = await self._get_client()
         result = client.get([id])
         if result:
@@ -325,14 +329,6 @@ class NanoVectorDBStorage(BaseVectorStorage):
         return None
 
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
-        """Get multiple vector data by their IDs
-
-        Args:
-            ids: List of unique identifiers
-
-        Returns:
-            List of vector data objects that were found
-        """
         if not ids:
             return []
 
@@ -359,15 +355,6 @@ class NanoVectorDBStorage(BaseVectorStorage):
         return ordered_results
 
     async def get_vectors_by_ids(self, ids: list[str]) -> dict[str, list[float]]:
-        """Get vectors by their IDs, returning only ID and vector data for efficiency
-
-        Args:
-            ids: List of unique identifiers
-
-        Returns:
-            Dictionary mapping IDs to their vector embeddings
-            Format: {id: [vector_values], ...}
-        """
         if not ids:
             return {}
 
@@ -387,41 +374,43 @@ class NanoVectorDBStorage(BaseVectorStorage):
         return vectors_dict
 
     async def drop(self) -> dict[str, str]:
-        """Drop all vector data from storage and clean up resources
-
-        This method will:
-        1. Remove the vector database storage file if it exists
-        2. Reinitialize the vector database client
-        3. Update flags to notify other processes
-        4. Changes is persisted to disk immediately
-
-        This method is intended for use in scenarios where all data needs to be removed,
-
-        Returns:
-            dict[str, str]: Operation status and message
-            - On success: {"status": "success", "message": "data dropped"}
-            - On failure: {"status": "error", "message": "<error details>"}
-        """
+        """Drop all vector data from storage and clean up resources"""
         try:
-            async with self._storage_lock:
-                # delete _client_file_name
-                if os.path.exists(self._client_file_name):
-                    os.remove(self._client_file_name)
+            state = await self._get_current_state()
 
-                self._client = NanoVectorDB(
+            async with state.storage_lock:
+                # delete file
+                if os.path.exists(state.client_file_name):
+                    os.remove(state.client_file_name)
+
+                # Re-initialize client (empty)
+                state.client = NanoVectorDB(
                     self.embedding_func.embedding_dim,
-                    storage_file=self._client_file_name,
+                    storage_file=state.client_file_name,
                 )
 
                 # Notify other processes that data has been updated
                 await set_all_update_flags(self.namespace, workspace=self.workspace)
                 # Reset own update flag to avoid self-reloading
-                self.storage_updated.value = False
+                state.storage_updated.value = False
 
                 logger.info(
-                    f"[{self.workspace}] Process {os.getpid()} drop {self.namespace}(file:{self._client_file_name})"
+                    f"[{self.workspace}] Process {os.getpid()} drop {self.namespace}(file:{state.client_file_name})"
                 )
+
+            # Optional: Remove from cache if you want to free memory
+            # self._states.pop(self.workspace, None)
+
             return {"status": "success", "message": "data dropped"}
         except Exception as e:
             logger.error(f"[{self.workspace}] Error dropping {self.namespace}: {e}")
             return {"status": "error", "message": str(e)}
+
+    async def finalize(self):
+        """Finalize storage resources (Save all workspaces)"""
+        for ws, state in self._states.items():
+            try:
+                # 简单的 finalize 保存逻辑
+                state.client.save()
+            except Exception as e:
+                logger.error(f"[{ws}] Finalize save error: {e}")

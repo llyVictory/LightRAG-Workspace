@@ -31,6 +31,7 @@ from .constants import (
     DEFAULT_OLLAMA_CREATED_AT,
     DEFAULT_OLLAMA_DIGEST,
 )
+from .context_utils import get_current_workspace
 
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
@@ -172,8 +173,14 @@ class QueryParam:
 @dataclass
 class StorageNameSpace(ABC):
     namespace: str
-    workspace: str
+    # workspace: str
     global_config: dict[str, Any]
+
+
+    @property
+    def workspace(self) -> str:
+        # 每次代码调用 self.workspace，都会自动执行这里，拿到当前的上下文
+        return get_current_workspace()
 
     async def initialize(self):
         """Initialize the storage"""

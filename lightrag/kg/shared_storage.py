@@ -10,6 +10,8 @@ from contextvars import ContextVar
 from typing import Any, Dict, List, Optional, Union, TypeVar, Generic
 
 from lightrag.exceptions import PipelineNotInitializedError
+# [新增] 引入 ContextVars 工具
+from lightrag.context_utils import get_current_workspace
 
 DEBUG_LOCKS = False
 
@@ -97,11 +99,37 @@ _debug_n_locks_acquired: int = 0
 
 
 def get_final_namespace(namespace: str, workspace: str | None = None):
+    """
+    Get the final namespace string combined with workspace.
+
+    Priority:
+    1. Explicit 'workspace' argument
+    2. ContextVars (current request context)
+    3. Global default workspace (fallback)
+    """
     global _default_workspace
-    if workspace is None:
-        workspace = _default_workspace
+
+    # 1. Use explicit workspace if provided
+    if workspace is not None:
+        pass
+    else:
+        # 2. Try to get from ContextVars
+        try:
+            ctx_workspace = get_current_workspace()
+            # ContextVars might return "default" string as default value,
+            # handle empty strings if necessary
+            if ctx_workspace:
+                workspace = ctx_workspace
+        except (ImportError, LookupError):
+            pass
+
+        # 3. Fallback to global default if still None
+        if workspace is None:
+            workspace = _default_workspace
 
     if workspace is None:
+        # Even after all checks, if it's still None, it's an error
+        # (Though get_current_workspace usually returns "default")
         direct_log(
             f"Error: Invoke namespace operation without workspace, pid={os.getpid()}",
             level="ERROR",
@@ -138,12 +166,12 @@ class UnifiedLock(Generic[T]):
     """Provide a unified lock interface type for asyncio.Lock and multiprocessing.Lock"""
 
     def __init__(
-        self,
-        lock: Union[ProcessLock, asyncio.Lock],
-        is_async: bool,
-        name: str = "unnamed",
-        enable_logging: bool = True,
-        async_lock: Optional[asyncio.Lock] = None,
+            self,
+            lock: Union[ProcessLock, asyncio.Lock],
+            is_async: bool,
+            name: str = "unnamed",
+            enable_logging: bool = True,
+            async_lock: Optional[asyncio.Lock] = None,
     ):
         self._lock = lock
         self._is_async = is_async
@@ -178,9 +206,9 @@ class UnifiedLock(Generic[T]):
         except Exception as e:
             # If main lock acquisition fails, release the async lock if it was acquired
             if (
-                not self._is_async
-                and self._async_lock is not None
-                and self._async_lock.locked()
+                    not self._is_async
+                    and self._async_lock is not None
+                    and self._async_lock.locked()
             ):
                 self._async_lock.release()
 
@@ -225,9 +253,9 @@ class UnifiedLock(Generic[T]):
 
             # If main lock release failed but async lock hasn't been released, try to release it
             if (
-                not main_lock_released
-                and not self._is_async
-                and self._async_lock is not None
+                    not main_lock_released
+                    and not self._is_async
+                    and self._async_lock is not None
             ):
                 try:
                     direct_log(
@@ -312,14 +340,14 @@ def _get_combined_key(factory_name: str, key: str) -> str:
 
 
 def _perform_lock_cleanup(
-    lock_type: str,
-    cleanup_data: Dict[str, float],
-    lock_registry: Optional[Dict[str, Any]],
-    lock_count: Optional[Dict[str, int]],
-    earliest_cleanup_time: Optional[float],
-    last_cleanup_time: Optional[float],
-    current_time: float,
-    threshold_check: bool = True,
+        lock_type: str,
+        cleanup_data: Dict[str, float],
+        lock_registry: Optional[Dict[str, Any]],
+        lock_count: Optional[Dict[str, int]],
+        earliest_cleanup_time: Optional[float],
+        last_cleanup_time: Optional[float],
+        current_time: float,
+        threshold_check: bool = True,
 ) -> tuple[int, Optional[float], Optional[float]]:
     """
     Generic lock cleanup function to unify cleanup logic for both multiprocess and async locks.
@@ -355,13 +383,13 @@ def _perform_lock_cleanup(
 
     # Check cleanup conditions
     has_expired_locks = (
-        earliest_cleanup_time is not None
-        and current_time - earliest_cleanup_time > CLEANUP_KEYED_LOCKS_AFTER_SECONDS
+            earliest_cleanup_time is not None
+            and current_time - earliest_cleanup_time > CLEANUP_KEYED_LOCKS_AFTER_SECONDS
     )
 
     interval_satisfied = (
-        last_cleanup_time is None
-        or current_time - last_cleanup_time > MIN_CLEANUP_INTERVAL_SECONDS
+            last_cleanup_time is None
+            or current_time - last_cleanup_time > MIN_CLEANUP_INTERVAL_SECONDS
     )
 
     if not (has_expired_locks and interval_satisfied):
@@ -433,7 +461,7 @@ def _perform_lock_cleanup(
 
 
 def _get_or_create_shared_raw_mp_lock(
-    factory_name: str, key: str
+        factory_name: str, key: str
 ) -> Optional[mp.synchronize.Lock]:
     """Return the *singleton* manager.Lock() proxy for keyed lock, creating if needed."""
     if not _is_multiprocess:
@@ -453,7 +481,7 @@ def _get_or_create_shared_raw_mp_lock(
                     f"Shared-Data lock registry for {factory_name} is corrupted for key {key}"
                 )
             if (
-                count == 0 and combined_key in _lock_cleanup_data
+                    count == 0 and combined_key in _lock_cleanup_data
             ):  # Reusing an key waiting for cleanup, remove it from cleanup list
                 _lock_cleanup_data.pop(combined_key)
         count += 1
@@ -493,8 +521,8 @@ def _release_shared_raw_mp_lock(factory_name: str, key: str):
 
             # Update earliest multiprocess cleanup time (only when earlier)
             if (
-                _earliest_mp_cleanup_time is None
-                or current_time < _earliest_mp_cleanup_time
+                    _earliest_mp_cleanup_time is None
+                    or current_time < _earliest_mp_cleanup_time
             ):
                 _earliest_mp_cleanup_time = current_time
 
@@ -547,7 +575,7 @@ class KeyedUnifiedLock:
         )
 
     def __call__(
-        self, namespace: str, keys: list[str], *, enable_logging: Optional[bool] = None
+            self, namespace: str, keys: list[str], *, enable_logging: Optional[bool] = None
     ):
         """
         Ergonomic helper so you can write:
@@ -586,8 +614,8 @@ class KeyedUnifiedLock:
 
             # Update earliest async cleanup time (only when earlier)
             if (
-                self._earliest_async_cleanup_time is None
-                or current_time < self._earliest_async_cleanup_time
+                    self._earliest_async_cleanup_time is None
+                    or current_time < self._earliest_async_cleanup_time
             ):
                 self._earliest_async_cleanup_time = current_time
         self._async_lock_count[combined_key] = count
@@ -610,7 +638,7 @@ class KeyedUnifiedLock:
             self._last_async_cleanup_time = new_last_cleanup_time
 
     def _get_lock_for_key(
-        self, namespace: str, key: str, enable_logging: bool = False
+            self, namespace: str, key: str, enable_logging: bool = False
     ) -> UnifiedLock:
         # 1. Create combined key for this namespace:key combination
         combined_key = _get_combined_key(namespace, key)
@@ -684,9 +712,9 @@ class KeyedUnifiedLock:
 
         # 1. Cleanup multiprocess locks using generic function
         if (
-            _is_multiprocess
-            and _lock_registry is not None
-            and _registry_guard is not None
+                _is_multiprocess
+                and _lock_registry is not None
+                and _registry_guard is not None
         ):
             try:
                 with _registry_guard:
@@ -806,11 +834,11 @@ class KeyedUnifiedLock:
 
 class _KeyedLockContext:
     def __init__(
-        self,
-        parent: KeyedUnifiedLock,
-        namespace: str,
-        keys: list[str],
-        enable_logging: bool,
+            self,
+            parent: KeyedUnifiedLock,
+            namespace: str,
+            keys: list[str],
+            enable_logging: bool,
     ) -> None:
         self._parent = parent
         self._namespace = namespace
@@ -1077,7 +1105,7 @@ def get_internal_lock(enable_logging: bool = False) -> UnifiedLock:
 
 
 def get_storage_keyed_lock(
-    keys: str | list[str], namespace: str = "default", enable_logging: bool = False
+        keys: str | list[str], namespace: str = "default", enable_logging: bool = False
 ) -> _KeyedLockContext:
     """Return unified storage keyed lock for ensuring atomic operations across different namespaces"""
     global _storage_keyed_lock
@@ -1333,8 +1361,12 @@ async def set_all_update_flags(namespace: str, workspace: str | None = None):
 
     async with get_internal_lock():
         if final_namespace not in _update_flags:
-            raise ValueError(f"Namespace {final_namespace} not found in update flags")
-        # Update flags for both modes
+            # [Fix] Instead of raising error, we can just return or log warning
+            # Because a new workspace might not have init flags yet
+            # raise ValueError(f"Namespace {final_namespace} not found in update flags")
+            return
+
+            # Update flags for both modes
         for i in range(len(_update_flags[final_namespace])):
             _update_flags[final_namespace][i].value = True
 
@@ -1349,7 +1381,9 @@ async def clear_all_update_flags(namespace: str, workspace: str | None = None):
 
     async with get_internal_lock():
         if final_namespace not in _update_flags:
-            raise ValueError(f"Namespace {final_namespace} not found in update flags")
+            # raise ValueError(f"Namespace {final_namespace} not found in update flags")
+            return
+
         # Update flags for both modes
         for i in range(len(_update_flags[final_namespace])):
             _update_flags[final_namespace][i].value = False
@@ -1397,7 +1431,7 @@ async def get_all_update_flags_status(workspace: str | None = None) -> Dict[str,
 
 
 async def try_initialize_namespace(
-    namespace: str, workspace: str | None = None
+        namespace: str, workspace: str | None = None
 ) -> bool:
     """
     Returns True if the current worker(process) gets initialization permission for loading data later.
@@ -1417,15 +1451,15 @@ async def try_initialize_namespace(
                 f"Process {os.getpid()} ready to initialize storage namespace: [{final_namespace}]"
             )
             return True
-        direct_log(
-            f"Process {os.getpid()} storage namespace already initialized: [{final_namespace}]"
-        )
+        # direct_log(
+        #     f"Process {os.getpid()} storage namespace already initialized: [{final_namespace}]"
+        # )
 
     return False
 
 
 async def get_namespace_data(
-    namespace: str, first_init: bool = False, workspace: str | None = None
+        namespace: str, first_init: bool = False, workspace: str | None = None
 ) -> Dict[str, Any]:
     """get the shared data reference for specific namespace
 
@@ -1449,8 +1483,8 @@ async def get_namespace_data(
         if final_namespace not in _shared_dicts:
             # Special handling for pipeline_status namespace
             if (
-                final_namespace.endswith(":pipeline_status")
-                or final_namespace == "pipeline_status"
+                    final_namespace.endswith(":pipeline_status")
+                    or final_namespace == "pipeline_status"
             ) and not first_init:
                 # Check if pipeline_status should have been initialized but wasn't
                 # This helps users to call initialize_pipeline_status() before get_namespace_data()
@@ -1489,7 +1523,7 @@ class NamespaceLock:
     """
 
     def __init__(
-        self, namespace: str, workspace: str | None = None, enable_logging: bool = False
+            self, namespace: str, workspace: str | None = None, enable_logging: bool = False
     ):
         self._namespace = namespace
         self._workspace = workspace
@@ -1536,32 +1570,9 @@ class NamespaceLock:
 
 
 def get_namespace_lock(
-    namespace: str, workspace: str | None = None, enable_logging: bool = False
+        namespace: str, workspace: str | None = None, enable_logging: bool = False
 ) -> NamespaceLock:
-    """Get a reusable namespace lock wrapper.
-
-    This function returns a NamespaceLock instance that can be used multiple times
-    safely, even in concurrent scenarios. Each use creates a fresh lock context
-    internally, preventing lock re-entrance errors.
-
-    Args:
-        namespace: The namespace to get the lock for.
-        workspace: Workspace identifier (may be empty string for global namespace)
-        enable_logging: Whether to enable lock operation logging
-
-    Returns:
-        NamespaceLock: A reusable lock wrapper that can be used with 'async with'
-
-    Example:
-        lock = get_namespace_lock("pipeline_status", workspace="space1")
-
-        # Can be used multiple times
-        async with lock:
-            await do_something()
-
-        async with lock:
-            await do_something_else()
-    """
+    """Get a reusable namespace lock wrapper."""
     return NamespaceLock(namespace, workspace, enable_logging)
 
 
@@ -1622,7 +1633,7 @@ def finalize_share_data():
                             # Clear Value objects in the list
                             for flag in flags_list:
                                 if hasattr(
-                                    flag, "value"
+                                        flag, "value"
                                 ):  # Check if it's a Value object
                                     flag.value = False
                             flags_list.clear()
@@ -1686,7 +1697,7 @@ def get_default_workspace() -> str:
 
 
 def get_pipeline_status_lock(
-    enable_logging: bool = False, workspace: str = None
+        enable_logging: bool = False, workspace: str = None
 ) -> NamespaceLock:
     """Return unified storage lock for pipeline status data consistency.
 

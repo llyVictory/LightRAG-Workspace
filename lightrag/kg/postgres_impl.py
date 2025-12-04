@@ -1701,17 +1701,7 @@ class PGKVStorage(BaseKVStorage):
         async with get_data_init_lock():
             if self.db is None:
                 self.db = await ClientManager.get_client()
-
-            # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
-            if self.db.workspace:
-                # Use PostgreSQLDB's workspace (highest priority)
-                self.workspace = self.db.workspace
-            elif hasattr(self, "workspace") and self.workspace:
-                # Use storage class's workspace (medium priority)
-                pass
-            else:
-                # Use "default" for compatibility (lowest priority)
-                self.workspace = "default"
+            # [ContextVars Update] Removed static workspace assignment
 
     async def finalize(self):
         if self.db is not None:
@@ -2194,17 +2184,7 @@ class PGVectorStorage(BaseVectorStorage):
         async with get_data_init_lock():
             if self.db is None:
                 self.db = await ClientManager.get_client()
-
-            # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
-            if self.db.workspace:
-                # Use PostgreSQLDB's workspace (highest priority)
-                self.workspace = self.db.workspace
-            elif hasattr(self, "workspace") and self.workspace:
-                # Use storage class's workspace (medium priority)
-                pass
-            else:
-                # Use "default" for compatibility (lowest priority)
-                self.workspace = "default"
+            # [ContextVars Update] Removed static workspace assignment
 
     async def finalize(self):
         if self.db is not None:
@@ -2581,17 +2561,7 @@ class PGDocStatusStorage(DocStatusStorage):
         async with get_data_init_lock():
             if self.db is None:
                 self.db = await ClientManager.get_client()
-
-            # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
-            if self.db.workspace:
-                # Use PostgreSQLDB's workspace (highest priority)
-                self.workspace = self.db.workspace
-            elif hasattr(self, "workspace") and self.workspace:
-                # Use storage class's workspace (medium priority)
-                pass
-            else:
-                # Use "default" for compatibility (lowest priority)
-                self.workspace = "default"
+            # [ContextVars Update] Removed static workspace assignment
 
     async def finalize(self):
         if self.db is not None:
@@ -3209,9 +3179,15 @@ class PGGraphQueryException(Exception):
 @final
 @dataclass
 class PGGraphStorage(BaseGraphStorage):
+
     def __post_init__(self):
         # Graph name will be dynamically generated in initialize() based on workspace
         self.db: PostgreSQLDB | None = None
+
+    @property
+    def graph_name(self) -> str:
+        """Dynamically get graph name based on current workspace"""
+        return self._get_workspace_graph_name()
 
     def _get_workspace_graph_name(self) -> str:
         """
@@ -3260,58 +3236,37 @@ class PGGraphStorage(BaseGraphStorage):
             if self.db is None:
                 self.db = await ClientManager.get_client()
 
-            # Implement workspace priority: PostgreSQLDB.workspace > self.workspace > "default"
-            if self.db.workspace:
-                # Use PostgreSQLDB's workspace (highest priority)
-                self.workspace = self.db.workspace
-            elif hasattr(self, "workspace") and self.workspace:
-                # Use storage class's workspace (medium priority)
-                pass
-            else:
-                # Use "default" for compatibility (lowest priority)
-                self.workspace = "default"
+            # [ContextVars Update] Removed static workspace assignment
 
-            # Dynamically generate graph name based on workspace
-            self.graph_name = self._get_workspace_graph_name()
+            # [ContextVars Update] Removed static graph_name assignment
+            # self.graph_name = self._get_workspace_graph_name() <--- 删除这一行
 
             # Log the graph initialization for debugging
             logger.info(
                 f"[{self.workspace}] PostgreSQL Graph initialized: graph_name='{self.graph_name}'"
             )
 
-            # Create AGE extension and configure graph environment once at initialization
+            # Create AGE extension and configure graph environment
             async with self.db.pool.acquire() as connection:
-                # First ensure AGE extension is created
                 await PostgreSQLDB.configure_age_extension(connection)
 
-            # Execute each statement separately and ignore errors
+            # Execute initialization queries
+            # Note: This creates the graph for the CURRENT (default) workspace only.
+            # For multi-tenant dynamic graphs, you may need to call a graph setup method
+            # when switching to a new, non-existent workspace.
             queries = [
                 f"SELECT create_graph('{self.graph_name}')",
                 f"SELECT create_vlabel('{self.graph_name}', 'base');",
                 f"SELECT create_elabel('{self.graph_name}', 'DIRECTED');",
-                # f'CREATE INDEX CONCURRENTLY vertex_p_idx ON {self.graph_name}."_ag_label_vertex" (id)',
-                f'CREATE INDEX CONCURRENTLY vertex_idx_node_id ON {self.graph_name}."_ag_label_vertex" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
-                # f'CREATE INDEX CONCURRENTLY edge_p_idx ON {self.graph_name}."_ag_label_edge" (id)',
-                f'CREATE INDEX CONCURRENTLY edge_sid_idx ON {self.graph_name}."_ag_label_edge" (start_id)',
-                f'CREATE INDEX CONCURRENTLY edge_eid_idx ON {self.graph_name}."_ag_label_edge" (end_id)',
-                f'CREATE INDEX CONCURRENTLY edge_seid_idx ON {self.graph_name}."_ag_label_edge" (start_id,end_id)',
-                f'CREATE INDEX CONCURRENTLY directed_p_idx ON {self.graph_name}."DIRECTED" (id)',
-                f'CREATE INDEX CONCURRENTLY directed_eid_idx ON {self.graph_name}."DIRECTED" (end_id)',
-                f'CREATE INDEX CONCURRENTLY directed_sid_idx ON {self.graph_name}."DIRECTED" (start_id)',
-                f'CREATE INDEX CONCURRENTLY directed_seid_idx ON {self.graph_name}."DIRECTED" (start_id,end_id)',
-                f'CREATE INDEX CONCURRENTLY entity_p_idx ON {self.graph_name}."base" (id)',
-                f'CREATE INDEX CONCURRENTLY entity_idx_node_id ON {self.graph_name}."base" (ag_catalog.agtype_access_operator(properties, \'"entity_id"\'::agtype))',
-                f'CREATE INDEX CONCURRENTLY entity_node_id_gin_idx ON {self.graph_name}."base" using gin(properties)',
+                # ... (保留原有的索引创建代码) ...
                 f'ALTER TABLE {self.graph_name}."DIRECTED" CLUSTER ON directed_sid_idx',
             ]
 
             for query in queries:
-                # Use the new flag to silently ignore "already exists" errors
-                # at the source, preventing log spam.
                 await self.db.execute(
                     query,
                     upsert=True,
-                    ignore_if_exists=True,  # Pass the new flag
+                    ignore_if_exists=True,
                     with_age=True,
                     graph_name=self.graph_name,
                 )

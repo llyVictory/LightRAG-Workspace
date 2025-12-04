@@ -18,7 +18,7 @@ from fastapi import (
     Depends,
     File,
     HTTPException,
-    UploadFile,
+    UploadFile, Query, Form,
 )
 from pydantic import BaseModel, Field, field_validator
 
@@ -31,7 +31,7 @@ from lightrag.utils import (
 )
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
-
+from lightrag.context_utils import set_current_workspace, reset_current_workspace
 
 @lru_cache(maxsize=1)
 def _is_docling_available() -> bool:
@@ -220,6 +220,7 @@ class InsertTextRequest(BaseModel):
         description="The text to insert",
     )
     file_source: str = Field(default=None, min_length=0, description="File Source")
+    workspace: str = Field(default="default", description="Workspace for data isolation")
 
     @field_validator("text", mode="after")
     @classmethod
@@ -255,6 +256,7 @@ class InsertTextsRequest(BaseModel):
     file_sources: list[str] = Field(
         default=None, min_length=0, description="Sources of the texts"
     )
+    workspace: str = Field(default="default", description="Workspace for data isolation")
 
     @field_validator("texts", mode="after")
     @classmethod
@@ -334,6 +336,7 @@ class ClearCacheRequest(BaseModel):
     All cache will be cleared regardless of the request content.
     """
 
+    workspace: str = Field(default="default", description="Workspace for data isolation")
     class Config:
         json_schema_extra = {"example": {}}
 
@@ -386,6 +389,7 @@ class DeleteDocRequest(BaseModel):
         default=False,
         description="Whether to delete cached LLM extraction results for the documents.",
     )
+    workspace: str = Field(default="default", description="Workspace for data isolation")
 
     @field_validator("doc_ids", mode="after")
     @classmethod
@@ -408,6 +412,7 @@ class DeleteDocRequest(BaseModel):
 
 class DeleteEntityRequest(BaseModel):
     entity_name: str = Field(..., description="The name of the entity to delete.")
+    workspace: str = Field(default="default", description="Workspace for data isolation")
 
     @field_validator("entity_name", mode="after")
     @classmethod
@@ -420,6 +425,7 @@ class DeleteEntityRequest(BaseModel):
 class DeleteRelationRequest(BaseModel):
     source_entity: str = Field(..., description="The name of the source entity.")
     target_entity: str = Field(..., description="The name of the target entity.")
+    workspace: str = Field(default="default", description="Workspace for data isolation")
 
     @field_validator("source_entity", "target_entity", mode="after")
     @classmethod
@@ -600,6 +606,7 @@ class DocumentsRequest(BaseModel):
     sort_direction: Literal["asc", "desc"] = Field(
         default="desc", description="Sort direction"
     )
+    workspace: str = Field(default="default", description="Workspace for data isolation")
 
     class Config:
         json_schema_extra = {
@@ -837,6 +844,18 @@ class DocumentManager:
 
     def is_supported_file(self, filename: str) -> bool:
         return any(filename.lower().endswith(ext) for ext in self.supported_extensions)
+
+# [新增] 后台任务 Wrapper
+async def _bg_task_wrapper(workspace: str, func, *args, **kwargs):
+    """Wraps a background task to ensure it runs with the correct workspace context."""
+    token = set_current_workspace(workspace)
+    try:
+        if asyncio.iscoroutinefunction(func):
+            await func(*args, **kwargs)
+        else:
+            func(*args, **kwargs)
+    finally:
+        reset_current_workspace(token)
 
 
 def validate_file_path_security(file_path_str: str, base_dir: Path) -> Optional[Path]:
@@ -1796,6 +1815,8 @@ async def background_delete_documents(
         get_namespace_data,
         get_namespace_lock,
     )
+    # [新增] 引入获取当前工作区的工具
+    from lightrag.context_utils import get_current_workspace
 
     pipeline_status = await get_namespace_data(
         "pipeline_status", workspace=rag.workspace
@@ -1881,6 +1902,27 @@ async def background_delete_documents(
                     ):
                         try:
                             deleted_files = []
+
+                            # 动态获取当前 workspace 对应的真实文件目录
+                            current_workspace = get_current_workspace()
+
+                            # 默认目录是 base_input_dir
+                            target_input_dir = doc_manager.base_input_dir
+
+                            # 如果有特定 workspace，拼接到子目录
+                            if current_workspace and current_workspace != "default":
+                                target_input_dir = target_input_dir / current_workspace
+
+                            # 确保目录存在 (防止 validate 报错)
+                            if not target_input_dir.exists():
+                                logger.warning(f"Workspace directory not found: {target_input_dir}")
+                                # 依然继续尝试，因为可能是文件路径记录的问题
+
+                            # 使用 动态计算的 target_input_dir 进行安全校验
+                            safe_file_path = validate_file_path_security(
+                                result.file_path, target_input_dir
+                            )
+
                             # SECURITY FIX: Use secure path validation to prevent arbitrary file deletion
                             safe_file_path = validate_file_path_security(
                                 result.file_path, doc_manager.input_dir
@@ -1922,7 +1964,7 @@ async def background_delete_documents(
                                             )
 
                                 # Also check and delete files from __enqueued__ directory
-                                enqueued_dir = doc_manager.input_dir / "__enqueued__"
+                                enqueued_dir = target_input_dir / "__enqueued__"
                                 if enqueued_dir.exists():
                                     # SECURITY FIX: Validate that the file path is safe before processing
                                     # Only proceed if the original path validation passed
@@ -2043,7 +2085,9 @@ def create_document_routes(
     @router.post(
         "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth)]
     )
-    async def scan_for_new_documents(background_tasks: BackgroundTasks):
+    async def scan_for_new_documents(background_tasks: BackgroundTasks,
+                                     workspace: str = Query("default", description="Workspace") # [修改] 增加参数
+                                     ):
         """
         Trigger the scanning process for new documents.
 
@@ -2054,22 +2098,20 @@ def create_document_routes(
         Returns:
             ScanResponse: A response object containing the scanning status and track_id
         """
-        # Generate track_id with "scan" prefix for scanning operation
-        track_id = generate_track_id("scan")
-
-        # Start the scanning process in the background with track_id
-        background_tasks.add_task(run_scanning_process, rag, doc_manager, track_id)
-        return ScanResponse(
-            status="scanning_started",
-            message="Scanning process has been initiated in the background",
-            track_id=track_id,
-        )
+        token = set_current_workspace(workspace) # [修改] 注入 Context
+        try:
+            track_id = generate_track_id("scan")
+            # [修改] 使用 Wrapper 启动后台任务
+            background_tasks.add_task(_bg_task_wrapper, workspace, run_scanning_process, rag, doc_manager, track_id)
+            return ScanResponse(status="scanning_started", message="Scanning initiated", track_id=track_id)
+        finally:
+            reset_current_workspace(token) # [修改] 清理 Context
 
     @router.post(
         "/upload", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def upload_to_input_dir(
-        background_tasks: BackgroundTasks, file: UploadFile = File(...)
+        background_tasks: BackgroundTasks, file: UploadFile = File(...),workspace: str = Form("default") # [修改] 从 Form Data 获取 workspace
     ):
         """
         Upload a file to the input directory and index it.
@@ -2089,9 +2131,18 @@ def create_document_routes(
         Raises:
             HTTPException: If the file type is not supported (400) or other errors occur (500).
         """
+        token = set_current_workspace(workspace) # [修改] 注入 Context
         try:
-            # Sanitize filename to prevent Path Traversal attacks
-            safe_filename = sanitize_filename(file.filename, doc_manager.input_dir)
+            # [修正点 1] 动态计算目标目录
+            # 使用 base_input_dir + workspace 来构建隔离的路径
+            target_dir = doc_manager.base_input_dir / workspace
+
+            # 确保目录存在
+            if not target_dir.exists():
+                target_dir.mkdir(parents=True, exist_ok=True)
+
+            # [修正点 2] 使用动态目录进行文件名安全检查
+            safe_filename = sanitize_filename(file.filename, target_dir)
 
             if not doc_manager.is_supported_file(safe_filename):
                 raise HTTPException(
@@ -2113,6 +2164,8 @@ def create_document_routes(
                 )
 
             file_path = doc_manager.input_dir / safe_filename
+            # [修正点 3] 使用动态目录构建文件路径
+            file_path = target_dir / safe_filename
             # Check if file already exists in file system
             if file_path.exists():
                 return InsertResponse(
@@ -2127,18 +2180,19 @@ def create_document_routes(
             track_id = generate_track_id("upload")
 
             # Add to background tasks and get track_id
-            background_tasks.add_task(pipeline_index_file, rag, file_path, track_id)
+            background_tasks.add_task(_bg_task_wrapper, workspace,pipeline_index_file, rag, file_path, track_id)
 
             return InsertResponse(
                 status="success",
                 message=f"File '{safe_filename}' uploaded successfully. Processing will continue in background.",
                 track_id=track_id,
             )
-
         except Exception as e:
             logger.error(f"Error /documents/upload: {file.filename}: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            reset_current_workspace(token)
 
     @router.post(
         "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
@@ -2162,6 +2216,7 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs during text processing (500).
         """
+        token = set_current_workspace(request.workspace) # [修改] 注入 Context
         try:
             # Check if file_source already exists in doc_status storage
             if (
@@ -2201,6 +2256,8 @@ def create_document_routes(
             track_id = generate_track_id("insert")
 
             background_tasks.add_task(
+                _bg_task_wrapper,
+                request.workspace,
                 pipeline_index_texts,
                 rag,
                 [request.text],
@@ -2217,6 +2274,8 @@ def create_document_routes(
             logger.error(f"Error /documents/text: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            reset_current_workspace(token)
 
     @router.post(
         "/texts",
@@ -2242,6 +2301,7 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs during text processing (500).
         """
+        token = set_current_workspace(request.workspace)
         try:
             # Check if any file_sources already exist in doc_status storage
             if request.file_sources:
@@ -2284,6 +2344,8 @@ def create_document_routes(
             track_id = generate_track_id("insert")
 
             background_tasks.add_task(
+                _bg_task_wrapper,
+                request.workspace,
                 pipeline_index_texts,
                 rag,
                 request.texts,
@@ -2304,7 +2366,9 @@ def create_document_routes(
     @router.delete(
         "", response_model=ClearDocumentsResponse, dependencies=[Depends(combined_auth)]
     )
-    async def clear_documents():
+    async def clear_documents(
+            workspace: str = Query("default") # [修改] 增加 workspace 参数
+    ):
         """
         Clear all documents from the RAG system.
 
@@ -2329,178 +2393,185 @@ def create_document_routes(
             get_namespace_data,
             get_namespace_lock,
         )
-
-        # Get pipeline status and lock
-        pipeline_status = await get_namespace_data(
-            "pipeline_status", workspace=rag.workspace
-        )
-        pipeline_status_lock = get_namespace_lock(
-            "pipeline_status", workspace=rag.workspace
-        )
-
-        # Check and set status with lock
-        async with pipeline_status_lock:
-            if pipeline_status.get("busy", False):
-                return ClearDocumentsResponse(
-                    status="busy",
-                    message="Cannot clear documents while pipeline is busy",
-                )
-            # Set busy to true
-            pipeline_status.update(
-                {
-                    "busy": True,
-                    "job_name": "Clearing Documents",
-                    "job_start": datetime.now().isoformat(),
-                    "docs": 0,
-                    "batchs": 0,
-                    "cur_batch": 0,
-                    "request_pending": False,  # Clear any previous request
-                    "latest_message": "Starting document clearing process",
-                }
-            )
-            # Cleaning history_messages without breaking it as a shared list object
-            del pipeline_status["history_messages"][:]
-            pipeline_status["history_messages"].append(
-                "Starting document clearing process"
-            )
+        token = set_current_workspace(workspace)
 
         try:
-            # Use drop method to clear all data
-            drop_tasks = []
-            storages = [
-                rag.text_chunks,
-                rag.full_docs,
-                rag.full_entities,
-                rag.full_relations,
-                rag.entity_chunks,
-                rag.relation_chunks,
-                rag.entities_vdb,
-                rag.relationships_vdb,
-                rag.chunks_vdb,
-                rag.chunk_entity_relation_graph,
-                rag.doc_status,
-            ]
+            # Get pipeline status and lock
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=rag.workspace
+            )
+            pipeline_status_lock = get_namespace_lock(
+                "pipeline_status", workspace=rag.workspace
+            )
 
-            # Log storage drop start
-            if "history_messages" in pipeline_status:
-                pipeline_status["history_messages"].append(
-                    "Starting to drop storage components"
-                )
-
-            for storage in storages:
-                if storage is not None:
-                    drop_tasks.append(storage.drop())
-
-            # Wait for all drop tasks to complete
-            drop_results = await asyncio.gather(*drop_tasks, return_exceptions=True)
-
-            # Check for errors and log results
-            errors = []
-            storage_success_count = 0
-            storage_error_count = 0
-
-            for i, result in enumerate(drop_results):
-                storage_name = storages[i].__class__.__name__
-                if isinstance(result, Exception):
-                    error_msg = f"Error dropping {storage_name}: {str(result)}"
-                    errors.append(error_msg)
-                    logger.error(error_msg)
-                    storage_error_count += 1
-                else:
-                    namespace = storages[i].namespace
-                    workspace = storages[i].workspace
-                    logger.info(
-                        f"Successfully dropped {storage_name}: {workspace}/{namespace}"
-                    )
-                    storage_success_count += 1
-
-            # Log storage drop results
-            if "history_messages" in pipeline_status:
-                if storage_error_count > 0:
-                    pipeline_status["history_messages"].append(
-                        f"Dropped {storage_success_count} storage components with {storage_error_count} errors"
-                    )
-                else:
-                    pipeline_status["history_messages"].append(
-                        f"Successfully dropped all {storage_success_count} storage components"
-                    )
-
-            # If all storage operations failed, return error status and don't proceed with file deletion
-            if storage_success_count == 0 and storage_error_count > 0:
-                error_message = "All storage drop operations failed. Aborting document clearing process."
-                logger.error(error_message)
-                if "history_messages" in pipeline_status:
-                    pipeline_status["history_messages"].append(error_message)
-                return ClearDocumentsResponse(status="fail", message=error_message)
-
-            # Log file deletion start
-            if "history_messages" in pipeline_status:
-                pipeline_status["history_messages"].append(
-                    "Starting to delete files in input directory"
-                )
-
-            # Delete only files in the current directory, preserve files in subdirectories
-            deleted_files_count = 0
-            file_errors_count = 0
-
-            for file_path in doc_manager.input_dir.glob("*"):
-                if file_path.is_file():
-                    try:
-                        file_path.unlink()
-                        deleted_files_count += 1
-                    except Exception as e:
-                        logger.error(f"Error deleting file {file_path}: {str(e)}")
-                        file_errors_count += 1
-
-            # Log file deletion results
-            if "history_messages" in pipeline_status:
-                if file_errors_count > 0:
-                    pipeline_status["history_messages"].append(
-                        f"Deleted {deleted_files_count} files with {file_errors_count} errors"
-                    )
-                    errors.append(f"Failed to delete {file_errors_count} files")
-                else:
-                    pipeline_status["history_messages"].append(
-                        f"Successfully deleted {deleted_files_count} files"
-                    )
-
-            # Prepare final result message
-            final_message = ""
-            if errors:
-                final_message = f"Cleared documents with some errors. Deleted {deleted_files_count} files."
-                status = "partial_success"
-            else:
-                final_message = f"All documents cleared successfully. Deleted {deleted_files_count} files."
-                status = "success"
-
-            # Log final result
-            if "history_messages" in pipeline_status:
-                pipeline_status["history_messages"].append(final_message)
-
-            # Return response based on results
-            return ClearDocumentsResponse(status=status, message=final_message)
-        except Exception as e:
-            error_msg = f"Error clearing documents: {str(e)}"
-            logger.error(error_msg)
-            logger.error(traceback.format_exc())
-            if "history_messages" in pipeline_status:
-                pipeline_status["history_messages"].append(error_msg)
-            raise HTTPException(status_code=500, detail=str(e))
-        finally:
-            # Reset busy status after completion
+            # Check and set status with lock
             async with pipeline_status_lock:
-                pipeline_status["busy"] = False
-                completion_msg = "Document clearing process completed"
-                pipeline_status["latest_message"] = completion_msg
+                if pipeline_status.get("busy", False):
+                    return ClearDocumentsResponse(
+                        status="busy",
+                        message="Cannot clear documents while pipeline is busy",
+                    )
+                # Set busy to true
+                pipeline_status.update(
+                    {
+                        "busy": True,
+                        "job_name": "Clearing Documents",
+                        "job_start": datetime.now().isoformat(),
+                        "docs": 0,
+                        "batchs": 0,
+                        "cur_batch": 0,
+                        "request_pending": False,  # Clear any previous request
+                        "latest_message": "Starting document clearing process",
+                    }
+                )
+                # Cleaning history_messages without breaking it as a shared list object
+                del pipeline_status["history_messages"][:]
+                pipeline_status["history_messages"].append(
+                    "Starting document clearing process"
+                )
+
+            try:
+                # Use drop method to clear all data
+                drop_tasks = []
+                storages = [
+                    rag.text_chunks,
+                    rag.full_docs,
+                    rag.full_entities,
+                    rag.full_relations,
+                    rag.entity_chunks,
+                    rag.relation_chunks,
+                    rag.entities_vdb,
+                    rag.relationships_vdb,
+                    rag.chunks_vdb,
+                    rag.chunk_entity_relation_graph,
+                    rag.doc_status,
+                ]
+
+                # Log storage drop start
                 if "history_messages" in pipeline_status:
-                    pipeline_status["history_messages"].append(completion_msg)
+                    pipeline_status["history_messages"].append(
+                        "Starting to drop storage components"
+                    )
+
+                for storage in storages:
+                    if storage is not None:
+                        drop_tasks.append(storage.drop())
+
+                # Wait for all drop tasks to complete
+                drop_results = await asyncio.gather(*drop_tasks, return_exceptions=True)
+
+                # Check for errors and log results
+                errors = []
+                storage_success_count = 0
+                storage_error_count = 0
+
+                for i, result in enumerate(drop_results):
+                    storage_name = storages[i].__class__.__name__
+                    if isinstance(result, Exception):
+                        error_msg = f"Error dropping {storage_name}: {str(result)}"
+                        errors.append(error_msg)
+                        logger.error(error_msg)
+                        storage_error_count += 1
+                    else:
+                        namespace = storages[i].namespace
+                        workspace = storages[i].workspace
+                        logger.info(
+                            f"Successfully dropped {storage_name}: {workspace}/{namespace}"
+                        )
+                        storage_success_count += 1
+
+                # Log storage drop results
+                if "history_messages" in pipeline_status:
+                    if storage_error_count > 0:
+                        pipeline_status["history_messages"].append(
+                            f"Dropped {storage_success_count} storage components with {storage_error_count} errors"
+                        )
+                    else:
+                        pipeline_status["history_messages"].append(
+                            f"Successfully dropped all {storage_success_count} storage components"
+                        )
+
+                # If all storage operations failed, return error status and don't proceed with file deletion
+                if storage_success_count == 0 and storage_error_count > 0:
+                    error_message = "All storage drop operations failed. Aborting document clearing process."
+                    logger.error(error_message)
+                    if "history_messages" in pipeline_status:
+                        pipeline_status["history_messages"].append(error_message)
+                    return ClearDocumentsResponse(status="fail", message=error_message)
+
+                # Log file deletion start
+                if "history_messages" in pipeline_status:
+                    pipeline_status["history_messages"].append(
+                        "Starting to delete files in input directory"
+                    )
+
+                # Delete only files in the current directory, preserve files in subdirectories
+                deleted_files_count = 0
+                file_errors_count = 0
+
+                for file_path in doc_manager.input_dir.glob("*"):
+                    if file_path.is_file():
+                        try:
+                            file_path.unlink()
+                            deleted_files_count += 1
+                        except Exception as e:
+                            logger.error(f"Error deleting file {file_path}: {str(e)}")
+                            file_errors_count += 1
+
+                # Log file deletion results
+                if "history_messages" in pipeline_status:
+                    if file_errors_count > 0:
+                        pipeline_status["history_messages"].append(
+                            f"Deleted {deleted_files_count} files with {file_errors_count} errors"
+                        )
+                        errors.append(f"Failed to delete {file_errors_count} files")
+                    else:
+                        pipeline_status["history_messages"].append(
+                            f"Successfully deleted {deleted_files_count} files"
+                        )
+
+                # Prepare final result message
+                final_message = ""
+                if errors:
+                    final_message = f"Cleared documents with some errors. Deleted {deleted_files_count} files."
+                    status = "partial_success"
+                else:
+                    final_message = f"All documents cleared successfully. Deleted {deleted_files_count} files."
+                    status = "success"
+
+                # Log final result
+                if "history_messages" in pipeline_status:
+                    pipeline_status["history_messages"].append(final_message)
+
+                # Return response based on results
+                return ClearDocumentsResponse(status=status, message=final_message)
+            except Exception as e:
+                error_msg = f"Error clearing documents: {str(e)}"
+                logger.error(error_msg)
+                logger.error(traceback.format_exc())
+                if "history_messages" in pipeline_status:
+                    pipeline_status["history_messages"].append(error_msg)
+                raise HTTPException(status_code=500, detail=str(e))
+            finally:
+                # Reset busy status after completion
+                async with pipeline_status_lock:
+                    pipeline_status["busy"] = False
+                    completion_msg = "Document clearing process completed"
+                    pipeline_status["latest_message"] = completion_msg
+                    if "history_messages" in pipeline_status:
+                        pipeline_status["history_messages"].append(completion_msg)
+        finally:
+            reset_current_workspace(token)
 
     @router.get(
         "/pipeline_status",
         dependencies=[Depends(combined_auth)],
         response_model=PipelineStatusResponse,
     )
-    async def get_pipeline_status() -> PipelineStatusResponse:
+    async def get_pipeline_status(
+            workspace: str = Query("default") # [修改]
+
+    ) -> PipelineStatusResponse:
         """
         Get the current status of the document indexing pipeline.
 
@@ -2524,6 +2595,7 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while retrieving pipeline status (500)
         """
+        token = set_current_workspace(workspace)
         try:
             from lightrag.kg.shared_storage import (
                 get_namespace_data,
@@ -2594,6 +2666,8 @@ def create_document_routes(
             logger.error(f"Error getting pipeline status: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            reset_current_workspace(token)
 
     # TODO: Deprecated, use /documents/paginated instead
     @router.get(
@@ -2740,6 +2814,7 @@ def create_document_routes(
               - 500: If an unexpected internal error occurs during initialization.
         """
         doc_ids = delete_request.doc_ids
+        token = set_current_workspace(delete_request.workspace)
 
         try:
             from lightrag.kg.shared_storage import (
@@ -2765,6 +2840,8 @@ def create_document_routes(
 
             # Add deletion task to background tasks
             background_tasks.add_task(
+                _bg_task_wrapper,
+                delete_request.workspace,
                 background_delete_documents,
                 rag,
                 doc_manager,
@@ -2784,6 +2861,8 @@ def create_document_routes(
             logger.error(error_msg)
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=error_msg)
+        finally:
+            reset_current_workspace(token)
 
     @router.post(
         "/clear_cache",
@@ -2806,6 +2885,7 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs during cache clearing (500).
         """
+        token = set_current_workspace(request.workspace)
         try:
             # Call the aclear_cache method (no modes parameter)
             await rag.aclear_cache()
@@ -2818,6 +2898,8 @@ def create_document_routes(
             logger.error(f"Error clearing cache: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            reset_current_workspace(token)
 
     @router.delete(
         "/delete_entity",
@@ -2837,6 +2919,7 @@ def create_document_routes(
         Raises:
             HTTPException: If the entity is not found (404) or an error occurs (500).
         """
+        token = set_current_workspace(request.workspace)
         try:
             result = await rag.adelete_by_entity(entity_name=request.entity_name)
             if result.status == "not_found":
@@ -2853,6 +2936,8 @@ def create_document_routes(
             logger.error(error_msg)
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=error_msg)
+        finally:
+            reset_current_workspace(token)
 
     @router.delete(
         "/delete_relation",
@@ -2872,6 +2957,7 @@ def create_document_routes(
         Raises:
             HTTPException: If the relation is not found (404) or an error occurs (500).
         """
+        token = set_current_workspace(request.workspace)
         try:
             result = await rag.adelete_by_relation(
                 source_entity=request.source_entity,
@@ -2891,13 +2977,17 @@ def create_document_routes(
             logger.error(error_msg)
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=error_msg)
+        finally:
+            reset_current_workspace(token)
 
     @router.get(
         "/track_status/{track_id}",
         response_model=TrackStatusResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_track_status(track_id: str) -> TrackStatusResponse:
+    async def get_track_status(track_id: str,
+                               workspace: str = Query("default")
+                               ) -> TrackStatusResponse:
         """
         Get the processing status of documents by tracking ID.
 
@@ -2916,6 +3006,7 @@ def create_document_routes(
         Raises:
             HTTPException: If track_id is invalid (400) or an error occurs (500).
         """
+        token = set_current_workspace(workspace)
         try:
             # Validate track_id
             if not track_id or not track_id.strip():
@@ -2965,6 +3056,8 @@ def create_document_routes(
             logger.error(f"Error getting track status for {track_id}: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            reset_current_workspace(token)
 
     @router.post(
         "/paginated",
@@ -2993,6 +3086,7 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while retrieving documents (500).
         """
+        token = set_current_workspace(request.workspace)
         try:
             # Get paginated documents and status counts in parallel
             docs_task = rag.doc_status.get_docs_paginated(
@@ -3052,13 +3146,15 @@ def create_document_routes(
             logger.error(f"Error getting paginated documents: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            reset_current_workspace(token)
 
     @router.get(
         "/status_counts",
         response_model=StatusCountsResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_document_status_counts() -> StatusCountsResponse:
+    async def get_document_status_counts(workspace: str = Query("default")) -> StatusCountsResponse:
         """
         Get counts of documents by status.
 
@@ -3071,6 +3167,7 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while retrieving status counts (500).
         """
+        token = set_current_workspace(workspace)
         try:
             status_counts = await rag.doc_status.get_all_status_counts()
             return StatusCountsResponse(status_counts=status_counts)
@@ -3079,13 +3176,15 @@ def create_document_routes(
             logger.error(f"Error getting document status counts: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            reset_current_workspace(token)
 
     @router.post(
         "/reprocess_failed",
         response_model=ReprocessResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def reprocess_failed_documents(background_tasks: BackgroundTasks):
+    async def reprocess_failed_documents(background_tasks: BackgroundTasks,workspace: str = Query("default") ):
         """
         Reprocess failed and pending documents.
 
@@ -3110,6 +3209,7 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while initiating reprocessing (500).
         """
+        token = set_current_workspace(workspace)
         try:
             # Start the reprocessing in the background
             # Note: Reprocessed documents retain their original track_id from initial upload
@@ -3125,13 +3225,17 @@ def create_document_routes(
             logger.error(f"Error initiating reprocessing of failed documents: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            reset_current_workspace(token)
 
     @router.post(
         "/cancel_pipeline",
         response_model=CancelPipelineResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def cancel_pipeline():
+    async def cancel_pipeline(
+            workspace: str = Query("default")
+    ):
         """
         Request cancellation of the currently running pipeline.
 
@@ -3152,6 +3256,7 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs while setting cancellation flag (500).
         """
+        token = set_current_workspace(workspace)
         try:
             from lightrag.kg.shared_storage import (
                 get_namespace_data,
@@ -3188,5 +3293,8 @@ def create_document_routes(
             logger.error(f"Error requesting pipeline cancellation: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
+
+        finally:
+            reset_current_workspace(token)
 
     return router

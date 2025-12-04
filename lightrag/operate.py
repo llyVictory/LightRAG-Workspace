@@ -7,7 +7,7 @@ import json
 import json_repair
 from typing import Any, AsyncIterator, overload, Literal
 from collections import Counter, defaultdict
-
+from lightrag.context_utils import get_current_workspace
 from lightrag.exceptions import (
     PipelineCancelledException,
     ChunkTokenLimitExceededError,
@@ -688,7 +688,7 @@ async def rebuild_knowledge_from_chunks(
     async def _locked_rebuild_entity(entity_name, chunk_ids):
         nonlocal rebuilt_entities_count, failed_entities_count
         async with semaphore:
-            workspace = global_config.get("workspace", "")
+            workspace = get_current_workspace()
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
             async with get_storage_keyed_lock(
                 [entity_name], namespace=namespace, enable_logging=False
@@ -717,7 +717,7 @@ async def rebuild_knowledge_from_chunks(
     async def _locked_rebuild_relationship(src, tgt, chunk_ids):
         nonlocal rebuilt_relationships_count, failed_relationships_count
         async with semaphore:
-            workspace = global_config.get("workspace", "")
+            workspace = get_current_workspace()
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
             # Sort src and tgt to ensure order-independent lock key generation
             sorted_key_parts = sorted([src, tgt])
@@ -2489,7 +2489,7 @@ async def merge_nodes_and_edges(
                             "User cancelled during entity merge"
                         )
 
-            workspace = global_config.get("workspace", "")
+            workspace = get_current_workspace()
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
             async with get_storage_keyed_lock(
                 [entity_name], namespace=namespace, enable_logging=False
@@ -2590,7 +2590,7 @@ async def merge_nodes_and_edges(
                             "User cancelled during relation merge"
                         )
 
-            workspace = global_config.get("workspace", "")
+            workspace = get_current_workspace()
             namespace = f"{workspace}:GraphDB" if workspace else "GraphDB"
             sorted_edge_key = sorted([edge_key[0], edge_key[1]])
 

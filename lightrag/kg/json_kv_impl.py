@@ -1,6 +1,7 @@
 import os
-from dataclasses import dataclass
-from typing import Any, final
+import asyncio
+from dataclasses import dataclass, field
+from typing import Any, final, Dict, Optional
 
 from lightrag.base import (
     BaseKVStorage,
@@ -21,113 +22,138 @@ from .shared_storage import (
     try_initialize_namespace,
 )
 
+# 1. 定义一个用于存放单个 Workspace 状态的小类
+@dataclass
+class WorkspaceState:
+    data: Any
+    storage_lock: Any
+    storage_updated: Any
+    file_name: str
 
 @final
 @dataclass
 class JsonKVStorage(BaseKVStorage):
+    # 2. 用于缓存不同 Workspace 状态的字典
+    _states: Dict[str, WorkspaceState] = field(default_factory=dict, init=False)
+
     def __post_init__(self):
-        working_dir = self.global_config["working_dir"]
-        if self.workspace:
-            # Include workspace in the file path for data isolation
-            workspace_dir = os.path.join(working_dir, self.workspace)
+        # 3. 这里只保存根目录，不再计算具体文件路径
+        self.working_dir = self.global_config["working_dir"]
+        self._states = {}
+
+        # 4. 【核心方法】动态获取当前 Workspace 的状态（懒加载）
+    async def _get_current_state(self) -> WorkspaceState:
+        # self.workspace 是通过 ContextVars 动态获取的当前工作区名
+        current_ws = self.workspace
+
+        # 如果这个工作区已经初始化过，直接返回缓存
+        if current_ws in self._states:
+            return self._states[current_ws]
+
+        # --- 下面是原本 initialize 的逻辑，现在改为针对特定 Workspace 初始化 ---
+
+        # 计算该 Workspace 的目录
+        if current_ws:
+            workspace_dir = os.path.join(self.working_dir, current_ws)
         else:
-            # Default behavior when workspace is empty
-            workspace_dir = working_dir
-            self.workspace = ""
+            workspace_dir = self.working_dir
 
         os.makedirs(workspace_dir, exist_ok=True)
-        self._file_name = os.path.join(workspace_dir, f"kv_store_{self.namespace}.json")
+        file_name = os.path.join(workspace_dir, f"kv_store_{self.namespace}.json")
 
-        self._data = None
-        self._storage_lock = None
-        self.storage_updated = None
+        # 获取共享锁和数据对象
+        storage_lock = get_namespace_lock(self.namespace, workspace=current_ws)
+        storage_updated = await get_update_flag(self.namespace, workspace=current_ws)
 
-    async def initialize(self):
-        """Initialize storage data"""
-        self._storage_lock = get_namespace_lock(
-            self.namespace, workspace=self.workspace
-        )
-        self.storage_updated = await get_update_flag(
-            self.namespace, workspace=self.workspace
-        )
         async with get_data_init_lock():
-            # check need_init must before get_namespace_data
-            need_init = await try_initialize_namespace(
-                self.namespace, workspace=self.workspace
-            )
-            self._data = await get_namespace_data(
-                self.namespace, workspace=self.workspace
-            )
+            need_init = await try_initialize_namespace(self.namespace, workspace=current_ws)
+            data = await get_namespace_data(self.namespace, workspace=current_ws)
+
             if need_init:
-                loaded_data = load_json(self._file_name) or {}
-                async with self._storage_lock:
-                    # Migrate legacy cache structure if needed
+                loaded_data = load_json(file_name) or {}
+                async with storage_lock:
+                    # 迁移旧数据结构的逻辑
                     if self.namespace.endswith("_cache"):
+                        # 注意：这里需要传入 context 里的 file_name
                         loaded_data = await self._migrate_legacy_cache_structure(
-                            loaded_data
+                            loaded_data, file_name, current_ws
                         )
 
-                    self._data.update(loaded_data)
+                    data.update(loaded_data)
                     data_count = len(loaded_data)
-
                     logger.info(
-                        f"[{self.workspace}] Process {os.getpid()} KV load {self.namespace} with {data_count} records"
+                        f"[{current_ws}] Process {os.getpid()} KV load {self.namespace} with {data_count} records"
                     )
 
-    async def index_done_callback(self) -> None:
-        async with self._storage_lock:
-            if self.storage_updated.value:
-                data_dict = (
-                    dict(self._data) if hasattr(self._data, "_getvalue") else self._data
-                )
+        # 创建状态对象并缓存
+        state = WorkspaceState(
+            data=data,
+            storage_lock=storage_lock,
+            storage_updated=storage_updated,
+            file_name=file_name
+        )
+        self._states[current_ws] = state
+        return state
 
-                # Calculate data count - all data is now flattened
+    async def initialize(self):
+        """
+        服务启动时调用。
+        由于是动态加载，这里只需要预热一下默认工作区，或者什么都不做。
+        """
+        # 预热当前上下文（通常是 default）
+        await self._get_current_state()
+
+    async def index_done_callback(self) -> None:
+        # 获取当前状态
+        state = await self._get_current_state()
+
+        async with state.storage_lock:
+            if state.storage_updated.value:
+                data_dict = (
+                    dict(state.data) if hasattr(state.data, "_getvalue") else state.data
+                )
                 data_count = len(data_dict)
 
                 logger.debug(
-                    f"[{self.workspace}] Process {os.getpid()} KV writting {data_count} records to {self.namespace}"
+                    f"[{self.workspace}] Process {os.getpid()} KV writing {data_count} records to {self.namespace}"
                 )
 
-                # Write JSON and check if sanitization was applied
-                needs_reload = write_json(data_dict, self._file_name)
+                needs_reload = write_json(data_dict, state.file_name)
 
-                # If data was sanitized, reload cleaned data to update shared memory
                 if needs_reload:
                     logger.info(
                         f"[{self.workspace}] Reloading sanitized data into shared memory for {self.namespace}"
                     )
-                    cleaned_data = load_json(self._file_name)
+                    cleaned_data = load_json(state.file_name)
                     if cleaned_data is not None:
-                        self._data.clear()
-                        self._data.update(cleaned_data)
+                        state.data.clear()
+                        state.data.update(cleaned_data)
 
                 await clear_all_update_flags(self.namespace, workspace=self.workspace)
 
     async def get_by_id(self, id: str) -> dict[str, Any] | None:
-        async with self._storage_lock:
-            result = self._data.get(id)
+        state = await self._get_current_state() # <--- 关键修改：先拿状态
+
+        async with state.storage_lock: # <--- 用状态里的锁
+            result = state.data.get(id) # <--- 用状态里的数据
             if result:
-                # Create a copy to avoid modifying the original data
                 result = dict(result)
-                # Ensure time fields are present, provide default values for old data
                 result.setdefault("create_time", 0)
                 result.setdefault("update_time", 0)
-                # Ensure _id field contains the clean ID
                 result["_id"] = id
             return result
 
     async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
-        async with self._storage_lock:
+        state = await self._get_current_state()
+
+        async with state.storage_lock:
             results = []
             for id in ids:
-                data = self._data.get(id, None)
+                data = state.data.get(id, None)
                 if data:
-                    # Create a copy to avoid modifying the original data
                     result = {k: v for k, v in data.items()}
-                    # Ensure time fields are present, provide default values for old data
                     result.setdefault("create_time", 0)
                     result.setdefault("update_time", 0)
-                    # Ensure _id field contains the clean ID
                     result["_id"] = id
                     results.append(result)
                 else:
@@ -135,64 +161,49 @@ class JsonKVStorage(BaseKVStorage):
             return results
 
     async def filter_keys(self, keys: set[str]) -> set[str]:
-        async with self._storage_lock:
-            return set(keys) - set(self._data.keys())
+        state = await self._get_current_state()
+        async with state.storage_lock:
+            return set(keys) - set(state.data.keys())
 
     async def upsert(self, data: dict[str, dict[str, Any]]) -> None:
-        """
-        Importance notes for in-memory storage:
-        1. Changes will be persisted to disk during the next index_done_callback
-        2. update flags to notify other processes that data persistence is needed
-        """
         if not data:
             return
 
         import time
+        current_time = int(time.time())
 
-        current_time = int(time.time())  # Get current Unix timestamp
+        state = await self._get_current_state() # 获取状态
 
         logger.debug(
             f"[{self.workspace}] Inserting {len(data)} records to {self.namespace}"
         )
-        if self._storage_lock is None:
+
+        # 这里的检查要改一下，检查 state 是否有效
+        if state is None:
             raise StorageNotInitializedError("JsonKVStorage")
-        async with self._storage_lock:
-            # Add timestamps to data based on whether key exists
+
+        async with state.storage_lock:
             for k, v in data.items():
-                # For text_chunks namespace, ensure llm_cache_list field exists
                 if self.namespace.endswith("text_chunks"):
                     if "llm_cache_list" not in v:
                         v["llm_cache_list"] = []
 
-                # Add timestamps based on whether key exists
-                if k in self._data:  # Key exists, only update update_time
+                if k in state.data:
                     v["update_time"] = current_time
-                else:  # New key, set both create_time and update_time
+                else:
                     v["create_time"] = current_time
                     v["update_time"] = current_time
-
                 v["_id"] = k
 
-            self._data.update(data)
+            state.data.update(data)
             await set_all_update_flags(self.namespace, workspace=self.workspace)
 
     async def delete(self, ids: list[str]) -> None:
-        """Delete specific records from storage by their IDs
-
-        Importance notes for in-memory storage:
-        1. Changes will be persisted to disk during the next index_done_callback
-        2. update flags to notify other processes that data persistence is needed
-
-        Args:
-            ids (list[str]): List of document IDs to be deleted from storage
-
-        Returns:
-            None
-        """
-        async with self._storage_lock:
+        state = await self._get_current_state()
+        async with state.storage_lock:
             any_deleted = False
             for doc_id in ids:
-                result = self._data.pop(doc_id, None)
+                result = state.data.pop(doc_id, None)
                 if result is not None:
                     any_deleted = True
 
@@ -200,72 +211,48 @@ class JsonKVStorage(BaseKVStorage):
                 await set_all_update_flags(self.namespace, workspace=self.workspace)
 
     async def is_empty(self) -> bool:
-        """Check if the storage is empty
-
-        Returns:
-            bool: True if storage contains no data, False otherwise
-        """
-        async with self._storage_lock:
-            return len(self._data) == 0
+        state = await self._get_current_state()
+        async with state.storage_lock:
+            return len(state.data) == 0
 
     async def drop(self) -> dict[str, str]:
-        """Drop all data from storage and clean up resources
-           This action will persistent the data to disk immediately.
-
-        This method will:
-        1. Clear all data from memory
-        2. Update flags to notify other processes
-        3. Trigger index_done_callback to save the empty state
-
-        Returns:
-            dict[str, str]: Operation status and message
-            - On success: {"status": "success", "message": "data dropped"}
-            - On failure: {"status": "error", "message": "<error details>"}
-        """
         try:
-            async with self._storage_lock:
-                self._data.clear()
+            state = await self._get_current_state()
+            async with state.storage_lock:
+                state.data.clear()
                 await set_all_update_flags(self.namespace, workspace=self.workspace)
 
             await self.index_done_callback()
             logger.info(
                 f"[{self.workspace}] Process {os.getpid()} drop {self.namespace}"
             )
+
+            # 可选：Drop 之后可能需要从缓存中移除这个 state，看具体业务需求
+            # self._states.pop(self.workspace, None)
+
             return {"status": "success", "message": "data dropped"}
         except Exception as e:
             logger.error(f"[{self.workspace}] Error dropping {self.namespace}: {e}")
             return {"status": "error", "message": str(e)}
 
-    async def _migrate_legacy_cache_structure(self, data: dict) -> dict:
-        """Migrate legacy nested cache structure to flattened structure
-
-        Args:
-            data: Original data dictionary that may contain legacy structure
-
-        Returns:
-            Migrated data dictionary with flattened cache keys (sanitized if needed)
-        """
+    # 注意：这个方法我加了 file_name 和 workspace 参数，因为它们不能再从 self 里取了
+    async def _migrate_legacy_cache_structure(self, data: dict, file_name: str, workspace: str) -> dict:
         from lightrag.utils import generate_cache_key
 
-        # Early return if data is empty
         if not data:
             return data
 
-        # Check first entry to see if it's already in new format
         first_key = next(iter(data.keys()))
         if ":" in first_key and len(first_key.split(":")) == 3:
-            # Already in flattened format, return as-is
             return data
 
         migrated_data = {}
         migration_count = 0
 
         for key, value in data.items():
-            # Check if this is a legacy nested cache structure
             if isinstance(value, dict) and all(
-                isinstance(v, dict) and "return" in v for v in value.values()
+                    isinstance(v, dict) and "return" in v for v in value.values()
             ):
-                # This looks like a legacy cache mode with nested structure
                 mode = key
                 for cache_hash, cache_entry in value.items():
                     cache_type = cache_entry.get("cache_type", "extract")
@@ -273,30 +260,37 @@ class JsonKVStorage(BaseKVStorage):
                     migrated_data[flattened_key] = cache_entry
                     migration_count += 1
             else:
-                # Keep non-cache data or already flattened cache data as-is
                 migrated_data[key] = value
 
         if migration_count > 0:
             logger.info(
-                f"[{self.workspace}] Migrated {migration_count} legacy cache entries to flattened structure"
+                f"[{workspace}] Migrated {migration_count} legacy cache entries to flattened structure"
             )
-            # Persist migrated data immediately and check if sanitization was applied
-            needs_reload = write_json(migrated_data, self._file_name)
+            # 使用传入的 file_name
+            needs_reload = write_json(migrated_data, file_name)
 
-            # If data was sanitized during write, reload cleaned data
             if needs_reload:
                 logger.info(
-                    f"[{self.workspace}] Reloading sanitized migration data for {self.namespace}"
+                    f"[{workspace}] Reloading sanitized migration data for {self.namespace}"
                 )
-                cleaned_data = load_json(self._file_name)
+                cleaned_data = load_json(file_name)
                 if cleaned_data is not None:
-                    return cleaned_data  # Return cleaned data to update shared memory
+                    return cleaned_data
 
         return migrated_data
 
     async def finalize(self):
-        """Finalize storage resources
-        Persistence cache data to disk before exiting
         """
-        if self.namespace.endswith("_cache"):
-            await self.index_done_callback()
+        服务关闭时调用。
+        需要遍历所有活跃的 workspace 进行保存。
+        """
+        # 遍历缓存中所有的 state 进行保存
+        for workspace, state in self._states.items():
+            if self.namespace.endswith("_cache"):
+                # 这里稍微 tricky，因为 index_done_callback 依赖 context
+                # 但 finalize 时 context 可能不对。
+                # 最好是手动把 index_done_callback 的逻辑抽取出来，或者在这里模拟 context
+                # 简单起见，我们直接复用 index_done_callback 的核心保存逻辑:
+                async with state.storage_lock:
+                    if state.storage_updated.value:
+                        write_json(dict(state.data), state.file_name)
