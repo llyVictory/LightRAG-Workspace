@@ -45,6 +45,8 @@ from lightrag.constants import (
     DEFAULT_LLM_TIMEOUT,
     DEFAULT_EMBEDDING_TIMEOUT,
 )
+from lightrag.api.routers.workspace_routes import create_workspace_routes
+
 from lightrag.api.routers.document_routes import (
     DocumentManager,
     create_document_routes,
@@ -285,8 +287,17 @@ def check_frontend_build():
 
 
 def create_app(args):
-    # Check frontend build first and get status
-    webui_assets_exist, is_frontend_outdated = check_frontend_build()
+    import os
+    # 如果环境变量 SKIP_WEBUI 为 true，则强制跳过 WebUI 加载
+    if os.getenv("SKIP_WEBUI", "false").lower() == "true":
+        # 引入 logger (确保文件顶部已定义或在此处获取)
+        from lightrag.utils import logger
+        logger.info("🚧 Dev Mode: Skipping WebUI mounting (API Only)")
+        webui_assets_exist = False
+        is_frontend_outdated = False
+    else:
+        # 正常逻辑：检查前端构建文件
+        webui_assets_exist, is_frontend_outdated = check_frontend_build()
 
     # Create unified API version display with warning symbol if frontend is outdated
     api_version_display = (
@@ -1092,6 +1103,8 @@ def create_app(args):
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
 
+    app.include_router(create_workspace_routes(rag, api_key))
+
     # Add Ollama API routes
     ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
     app.include_router(ollama_api.router, prefix="/api")
@@ -1228,10 +1241,14 @@ def create_app(args):
             default_workspace = get_default_workspace()
             if workspace is None:
                 workspace = default_workspace
-            pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=workspace
-            )
-
+            try:
+                pipeline_status = await get_namespace_data(
+                    "pipeline_status", workspace=workspace
+                )
+            except Exception:
+                # 如果工作空间不存在或未初始化，这在前端刚连接新环境时很常见
+                # 此时我们默认 pipeline 不处于繁忙状态，允许 health 检查通过
+                pipeline_status = {"busy": False}
             if not auth_configured:
                 auth_mode = "disabled"
             else:

@@ -138,6 +138,7 @@ class LightRAG:
     working_dir: str = field(default="./rag_storage")
     """Directory where cache and temporary files are stored."""
 
+    inputsing_dir: str = field(default="./inputs")
     # Storage
     # ---
 

@@ -279,6 +279,7 @@ class LightragPathFilter(logging.Filter):
         super().__init__()
         # Define paths to be filtered
         self.filtered_paths = [
+            "/workspace",
             "/documents",
             "/documents/paginated",
             "/health",
