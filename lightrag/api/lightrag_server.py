@@ -1101,7 +1101,7 @@ def create_app(args):
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
 
-    app.include_router(create_workspace_routes(rag, api_key))
+    app.include_router(create_workspace_routes(rag, doc_manager,api_key))
 
     # Add Ollama API routes
     ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
@@ -1239,17 +1239,14 @@ def create_app(args):
             default_workspace = get_default_workspace()
             if workspace is None:
                 workspace = default_workspace
-            pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=workspace
-            )
-            # try:
-            #     pipeline_status = await get_namespace_data(
-            #         "pipeline_status", workspace=workspace
-            #     )
-            # except Exception:
-            #     # 如果工作空间不存在或未初始化，这在前端刚连接新环境时很常见
-            #     # 此时我们默认 pipeline 不处于繁忙状态，允许 health 检查通过
-            #     pipeline_status = {"busy": False}
+            try:
+                pipeline_status = await get_namespace_data(
+                    "pipeline_status", workspace=workspace
+                )
+            except Exception:
+                # 如果工作空间不存在或未初始化，这在前端刚连接新环境时很常见
+                # 此时我们默认 pipeline 不处于繁忙状态，允许 health 检查通过
+                pipeline_status = {"busy": False}
             if not auth_configured:
                 auth_mode = "disabled"
             else:

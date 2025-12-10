@@ -3,6 +3,7 @@ import { backendBaseUrl, popularLabelsDefaultLimit, searchLabelsDefaultLimit } f
 import { errorMessage } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settings'
 import { navigationService } from '@/services/navigation'
+import { useWorkspaceStore } from '@/stores/workspace';
 
 // Types
 export type LightragNodeType = {
@@ -137,6 +138,8 @@ export type QueryRequest = {
   user_prompt?: string
   /** Enable reranking for retrieved text chunks. If True but no rerank model is configured, a warning will be issued. Default is True. */
   enable_rerank?: boolean
+  /** */
+  workspace: string
 }
 
 export type QueryResponse = {
@@ -215,6 +218,7 @@ export type DocumentsRequest = {
   page_size: number
   sort_field: 'created_at' | 'updated_at' | 'id' | 'file_path'
   sort_direction: 'asc' | 'desc'
+  workspace: string
 }
 
 export type PaginationInfo = {
@@ -289,6 +293,36 @@ const axiosInstance = axios.create({
 axiosInstance.interceptors.request.use((config) => {
   const apiKey = useSettingsStore.getState().apiKey
   const token = localStorage.getItem('LIGHTRAG-API-TOKEN');
+
+
+  const workspace = useWorkspaceStore.getState().currentWorkspace || 'default';
+  // 注入 Workspace Header
+  if (workspace) {
+    config.headers['LIGHTRAG-WORKSPACE'] = workspace;
+  }
+  // 根据请求类型注入参数
+  if (config.method === 'get') {
+    // GET 请求：注入到 URL 查询参数
+    config.params = {
+      ...config.params,
+      workspace
+    };
+  } else {
+    // POST/PUT/DELETE 请求：注入到 Body
+    if (config.data instanceof FormData) {
+      // 如果是 FormData (文件上传)，append 进去
+      config.data.append('workspace', workspace);
+    } else if (typeof config.data === 'object' && config.data !== null) {
+      // 如果是 JSON 对象，合并进去
+      config.data = {
+        ...config.data,
+        workspace
+      };
+    } else if (!config.data) {
+      // 如果没有 Body，创建一个包含 workspace 的 Body
+      config.data = { workspace };
+    }
+  }
 
   // Always include token if it exists, regardless of path
   if (token) {
@@ -407,12 +441,17 @@ export const queryTextStream = async (
   if (apiKey) {
     headers['X-API-Key'] = apiKey;
   }
+  const workspace = useWorkspaceStore.getState().currentWorkspace || 'default';
+  const requestBody = {
+    ...request,
+    workspace
+  };
 
   try {
     const response = await fetch(`${backendBaseUrl}/query/stream`, {
       method: 'POST',
       headers: headers,
-      body: JSON.stringify(request),
+      body: JSON.stringify(requestBody),
     });
 
     if (!response.ok) {
@@ -591,7 +630,6 @@ export const uploadDocument = async (
 ): Promise<DocActionResponse> => {
   const formData = new FormData()
   formData.append('file', file)
-
   const response = await axiosInstance.post('/documents/upload', formData, {
     headers: {
       'Content-Type': 'multipart/form-data'
@@ -815,3 +853,20 @@ export const getDocumentStatusCounts = async (): Promise<StatusCountsResponse> =
   const response = await axiosInstance.get('/documents/status_counts')
   return response.data
 }
+
+
+// [新增] Workspace 相关接口
+export const listWorkspaces = async (): Promise<{ name: string; created_at: string; is_default: boolean }[]> => {
+  const response = await axiosInstance.get('/workspace/list');
+  return response.data;
+};
+
+export const createWorkspace = async (name: string) => {
+  const response = await axiosInstance.post('/workspace/create', { name });
+  return response.data;
+};
+
+export const deleteWorkspace = async (name: string) => {
+  const response = await axiosInstance.delete(`/workspace/delete?workspace=${encodeURIComponent(name)}`);
+  return response.data;
+};

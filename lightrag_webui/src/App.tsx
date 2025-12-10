@@ -17,7 +17,7 @@ import RetrievalTesting from '@/features/RetrievalTesting'
 import ApiSite from '@/features/ApiSite'
 
 import { Tabs, TabsContent } from '@/components/ui/Tabs'
-
+import { WorkspaceSidebar } from '@/components/WorkspaceSidebar'
 function App() {
   const message = useBackendState.use.message()
   const enableHealthCheck = useSettingsStore.use.enableHealthCheck()
@@ -197,6 +197,11 @@ function App() {
         ) : (
           // Main content after initialization
           <main className="flex h-screen w-screen overflow-hidden">
+
+            {/* [新增] 1. 左侧工作区侧边栏 */}
+            <WorkspaceSidebar />
+            {/* [修改] 2. 右侧主要内容区域 (包裹原有内容) */}
+            <div className="flex-1 flex flex-col min-w-0 overflow-hidden relative">
             <Tabs
               defaultValue={currentTab}
               className="!m-0 flex grow flex-col !p-0 overflow-hidden"
@@ -220,6 +225,7 @@ function App() {
             </Tabs>
             {enableHealthCheck && <StatusIndicator />}
             <ApiKeyAlert open={apiKeyAlertOpen} onOpenChange={handleApiKeyAlertOpenChange} />
+            </div>
           </main>
         )}
       </TabVisibilityProvider>
