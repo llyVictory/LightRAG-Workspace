@@ -287,11 +287,9 @@ def check_frontend_build():
 
 
 def create_app(args):
-    import os
     # 如果环境变量 SKIP_WEBUI 为 true，则强制跳过 WebUI 加载
     if os.getenv("SKIP_WEBUI", "false").lower() == "true":
         # 引入 logger (确保文件顶部已定义或在此处获取)
-        from lightrag.utils import logger
         logger.info("🚧 Dev Mode: Skipping WebUI mounting (API Only)")
         webui_assets_exist = False
         is_frontend_outdated = False
@@ -1241,14 +1239,17 @@ def create_app(args):
             default_workspace = get_default_workspace()
             if workspace is None:
                 workspace = default_workspace
-            try:
-                pipeline_status = await get_namespace_data(
-                    "pipeline_status", workspace=workspace
-                )
-            except Exception:
-                # 如果工作空间不存在或未初始化，这在前端刚连接新环境时很常见
-                # 此时我们默认 pipeline 不处于繁忙状态，允许 health 检查通过
-                pipeline_status = {"busy": False}
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=workspace
+            )
+            # try:
+            #     pipeline_status = await get_namespace_data(
+            #         "pipeline_status", workspace=workspace
+            #     )
+            # except Exception:
+            #     # 如果工作空间不存在或未初始化，这在前端刚连接新环境时很常见
+            #     # 此时我们默认 pipeline 不处于繁忙状态，允许 health 检查通过
+            #     pipeline_status = {"busy": False}
             if not auth_configured:
                 auth_mode = "disabled"
             else:
