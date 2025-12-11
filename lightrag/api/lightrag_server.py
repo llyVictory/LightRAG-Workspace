@@ -62,6 +62,7 @@ from lightrag.kg.shared_storage import (
     # set_default_workspace,
     cleanup_keyed_lock,
     finalize_share_data,
+    initialize_pipeline_status
 )
 from fastapi.security import OAuth2PasswordRequestForm
 from lightrag.api.auth import auth_handler
@@ -1239,21 +1240,36 @@ def create_app(args):
             default_workspace = get_default_workspace()
             if workspace is None:
                 workspace = default_workspace
+            # --- 懒加载/自动恢复机制 ---
             try:
-                pipeline_status = await get_namespace_data(
-                    "pipeline_status", workspace=workspace
-                )
+                # 1. 尝试正常获取状态
+                pipeline_status = await get_namespace_data("pipeline_status", workspace=workspace)
             except Exception:
-                # 如果工作空间不存在或未初始化，这在前端刚连接新环境时很常见
-                # 此时我们默认 pipeline 不处于繁忙状态，允许 health 检查通过
-                pipeline_status = {"busy": False}
+                # 2. 如果失败（通常是 Namespace not found），则尝试自动初始化
+                # 这种情况常见于：服务器刚重启、或者这是一个新的工作区或者切换了工作区
+                logger.info(f"Workspace '{workspace}' status not found. Auto-initializing...")
+                try:
+                    await initialize_pipeline_status(workspace=workspace)
+                    # 3. 初始化后，再次尝试获取
+                    pipeline_status = await get_namespace_data("pipeline_status", workspace=workspace)
+                    logger.info(f"Successfully auto-initialized workspace '{workspace}'")
+                except Exception as init_error:
+                    logger.error(f"Failed to auto-initialize workspace '{workspace}': {str(init_error)}")
+                    # 如果还是失败，说明是真的出问题了（比如磁盘满、权限错误），这时候再抛出异常
+                    raise HTTPException(status_code=500, detail=f"Failed to initialize workspace: {str(init_error)}")
+            # ----------------------------------------
             if not auth_configured:
                 auth_mode = "disabled"
             else:
                 auth_mode = "enabled"
 
             # Cleanup expired keyed locks and get status
-            keyed_lock_info = cleanup_keyed_lock()
+            # 加一层 try-except 防止锁文件损坏导致整个接口挂掉
+            try:
+                keyed_lock_info = cleanup_keyed_lock()
+            except Exception as e:
+                logger.warning(f"Failed to cleanup locks: {e}")
+                keyed_lock_info = {}
 
             return {
                 "status": "healthy",
@@ -1277,7 +1293,7 @@ def create_app(args):
                     "vector_storage": args.vector_storage,
                     "enable_llm_cache_for_extract": args.enable_llm_cache_for_extract,
                     "enable_llm_cache": args.enable_llm_cache,
-                    "workspace": default_workspace,
+                    "workspace": workspace,
                     "max_graph_nodes": args.max_graph_nodes,
                     # Rerank configuration
                     "enable_rerank": rerank_model_func is not None,

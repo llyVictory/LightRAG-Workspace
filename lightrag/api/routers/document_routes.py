@@ -31,7 +31,7 @@ from lightrag.utils import (
 )
 from lightrag.api.utils_api import get_combined_auth_dependency
 from ..config import global_args
-from lightrag.context_utils import set_current_workspace, reset_current_workspace
+from lightrag.context_utils import set_current_workspace, reset_current_workspace,get_current_workspace
 
 @lru_cache(maxsize=1)
 def _is_docling_available() -> bool:
@@ -306,6 +306,17 @@ class InsertResponse(BaseModel):
             }
         }
 
+
+class ClearDocumentsRequest(BaseModel):
+    """Request model for clearing documents
+
+    Attributes:
+        workspace: Workspace for data isolation
+    """
+    workspace: str = Field(default="default", description="Workspace for data isolation")
+
+    class Config:
+        json_schema_extra = {"example": {}}
 
 class ClearDocumentsResponse(BaseModel):
     """Response model for document clearing operation
@@ -1815,14 +1826,13 @@ async def background_delete_documents(
         get_namespace_data,
         get_namespace_lock,
     )
-    # [新增] 引入获取当前工作区的工具
-    from lightrag.context_utils import get_current_workspace
+    current_workspace = get_current_workspace()
 
     pipeline_status = await get_namespace_data(
-        "pipeline_status", workspace=rag.workspace
+        "pipeline_status", workspace=current_workspace
     )
     pipeline_status_lock = get_namespace_lock(
-        "pipeline_status", workspace=rag.workspace
+        "pipeline_status", workspace=current_workspace
     )
 
     total_docs = len(doc_ids)
@@ -1903,8 +1913,6 @@ async def background_delete_documents(
                         try:
                             deleted_files = []
 
-                            # 动态获取当前 workspace 对应的真实文件目录
-                            current_workspace = get_current_workspace()
 
                             # 默认目录是 base_input_dir
                             target_input_dir = doc_manager.base_input_dir
@@ -2367,7 +2375,7 @@ def create_document_routes(
         "", response_model=ClearDocumentsResponse, dependencies=[Depends(combined_auth)]
     )
     async def clear_documents(
-            workspace: str = Query("default") # [修改] 增加 workspace 参数
+            request: ClearDocumentsRequest
     ):
         """
         Clear all documents from the RAG system.
@@ -2393,15 +2401,15 @@ def create_document_routes(
             get_namespace_data,
             get_namespace_lock,
         )
-        token = set_current_workspace(workspace)
-
+        current_workspace = request.workspace
+        token = set_current_workspace(current_workspace)
         try:
             # Get pipeline status and lock
             pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=current_workspace
             )
             pipeline_status_lock = get_namespace_lock(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=current_workspace
             )
 
             # Check and set status with lock
@@ -2604,14 +2612,14 @@ def create_document_routes(
             )
 
             pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=workspace
             )
             pipeline_status_lock = get_namespace_lock(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=workspace
             )
 
             # Get update flags status for all namespaces
-            update_status = await get_all_update_flags_status(workspace=rag.workspace)
+            update_status = await get_all_update_flags_status(workspace=workspace)
 
             # Convert MutableBoolean objects to regular boolean values
             processed_update_status = {}
@@ -2814,7 +2822,8 @@ def create_document_routes(
               - 500: If an unexpected internal error occurs during initialization.
         """
         doc_ids = delete_request.doc_ids
-        token = set_current_workspace(delete_request.workspace)
+        current_workspace = delete_request.workspace
+        token = set_current_workspace(current_workspace)
 
         try:
             from lightrag.kg.shared_storage import (
@@ -2823,10 +2832,10 @@ def create_document_routes(
             )
 
             pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=current_workspace
             )
             pipeline_status_lock = get_namespace_lock(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=current_workspace
             )
 
             # Check if pipeline is busy with proper lock
@@ -2885,7 +2894,8 @@ def create_document_routes(
         Raises:
             HTTPException: If an error occurs during cache clearing (500).
         """
-        token = set_current_workspace(request.workspace)
+        current_workspace = request.workspace
+        token = set_current_workspace(current_workspace)
         try:
             # Call the aclear_cache method (no modes parameter)
             await rag.aclear_cache()
@@ -3264,10 +3274,10 @@ def create_document_routes(
             )
 
             pipeline_status = await get_namespace_data(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=workspace
             )
             pipeline_status_lock = get_namespace_lock(
-                "pipeline_status", workspace=rag.workspace
+                "pipeline_status", workspace=workspace
             )
 
             async with pipeline_status_lock:

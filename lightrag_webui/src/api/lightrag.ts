@@ -870,3 +870,8 @@ export const deleteWorkspace = async (name: string) => {
   const response = await axiosInstance.delete(`/workspace/delete?workspace=${encodeURIComponent(name)}`);
   return response.data;
 };
+
+export const initializeWorkspace = async (name: string) => {
+  const response = await axiosInstance.post('/workspace/initialize', { name });
+  return response.data;
+};

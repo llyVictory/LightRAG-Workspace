@@ -18,6 +18,12 @@ from ..utils_api import get_combined_auth_dependency
 from .document_routes import  DocumentManager,ClearDocumentsResponse, ClearCacheRequest, ClearCacheResponse
 from ...exceptions import UnprocessableEntityError
 
+from lightrag.kg.shared_storage import (
+    get_namespace_data,
+    get_namespace_lock,
+    initialize_pipeline_status,
+)
+
 router = APIRouter(
     prefix="/workspace",
     tags=["workspace"],
@@ -25,6 +31,9 @@ router = APIRouter(
 
 
 # --- Request/Response Models ---
+
+class InitializeWorkspaceRequest(BaseModel):
+    name: str = Field(..., min_length=1, description="Name of the workspace to initialize")
 
 class WorkspaceInfo(BaseModel):
     name: str = Field(description="Name of the workspace")
@@ -365,6 +374,13 @@ def create_workspace_routes(rag, doc_manager: DocumentManager, api_key: Optional
             target_work_path.mkdir(parents=True, exist_ok=True)
             target_input_path.mkdir(parents=True, exist_ok=True)
 
+            # --- 【新增】初始化 Pipeline Status ---
+            # 这会在 rag_storage/request.name/ 目录下创建 kv_store_pipeline_status.json
+            # 从而避免后续调用 /health 时的 "namespace not found" 错误
+            logger.info(f"Initializing pipeline status for workspace: {request.name}")
+            await initialize_pipeline_status(workspace=request.name)
+            # ------------------------------------
+
             logger.info(f"Created new workspace: {request.name}")
             return {"status": "success", "message": f"Workspace '{request.name}' created successfully"}
 
@@ -414,6 +430,38 @@ def create_workspace_routes(rag, doc_manager: DocumentManager, api_key: Optional
             raise
         except Exception as e:
             logger.error(f"Error deleting workspace: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+
+    @router.post("/initialize", dependencies=[Depends(combined_auth)])
+    async def initialize_workspace(request: InitializeWorkspaceRequest):
+        """
+        Manually trigger initialization for a specific workspace.
+        This is useful when switching workspaces to ensure backend storage is ready
+        before accessing health or other endpoints.
+        """
+        try:
+            # 1. 安全检查：确保文件夹存在且路径合法
+            target_work_path = get_workspace_dir(WORKING_DIR, request.name)
+
+            if not target_work_path.exists():
+                raise HTTPException(status_code=404, detail=f"Workspace '{request.name}' does not exist")
+
+            # 2. 执行初始化
+            # 这会检查并创建缺失的 pipeline_status KV 存储
+            logger.info(f"Manual initialization requested for workspace: {request.name}")
+            await initialize_pipeline_status(workspace=request.name)
+
+            return {
+                "status": "success",
+                "message": f"Workspace '{request.name}' initialized successfully"
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error initializing workspace {request.name}: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
     # @router.put("/rename", dependencies=[Depends(combined_auth)])
