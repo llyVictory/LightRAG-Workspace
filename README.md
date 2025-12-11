@@ -51,12 +51,52 @@
 
 ---
 
-## 🎉 新闻
+# 🎉 新闻
 
 ---
 
+## [2025.12.11] 🚀 v0.2.0: 多工作区管理与数据隔离
 
-## [2025.12.04] 🚀 v1.0.0-beta（Pre-release）
+本次更新引入了完整的多工作区（Workspace）管理功能，包括前端的可视化增删改查界面，以及后端严格的数据隔离机制。同时，系统增加了自动恢复机制，显著提升了多工作区切换时的稳定性。
+
+![img_2.png](img_2.png)
+![img_3.png](img_3.png)
+![img_4.png](img_4.png)
+
+
+
+### 🚀 新增功能 (New Features)
+
+#### 🏢 前端工作区管理 (Frontend Workspace Management)
+- **可视化侧边栏**：新增 `WorkspaceSidebar` 组件，支持直观地查看、创建和删除工作区。
+- **全生命周期管理**：
+    - **创建 (Create)**：支持新建工作区，自动在后端创建对应的数据目录。
+    - **列表 (List)**：实时展示当前所有可用的工作区。
+    - **删除 (Delete)**：支持安全删除非默认工作区及其所有数据。
+    - **切换 (Switch)**：实现了平滑的工作区切换体验，带加载状态反馈。
+- **交互优化**：引入了 `Loader2` 加载动画和 Toast 提示，操作反馈更清晰。
+
+#### 🔒 后端数据隔离 (Backend Data Isolation)
+- **图谱与问答隔离**：图谱查询（Graph Query）和问答（Q&A）接口现已完全支持 `LIGHTRAG-WORKSPACE` 隔离。不同工作区的数据互不可见，互不干扰。
+- **上下文感知**：所有的知识图谱操作（节点插入、关系构建、检索）现在都会自动绑定到当前活跃的工作区。
+
+#### 🛠️ 系统稳定性 (System Stability)
+- **初始化 (Auto-Initialization)**：
+    - 在 `/health` 接口增加了**懒加载/兜底机制**。如果服务器重启后内存中丢失了某个工作区的状态，后端会自动检测并重新初始化，彻底修复了 "Pipeline namespace not found" 的 500 错误。
+
+
+### 📦 API 变更
+- **新增 API 路由** (`/workspace/*`)：
+    - `POST /workspace/create`: 创建新工作区。
+    - `DELETE /workspace/delete`: 删除指定工作区。
+    - `GET /workspace/list`: 获取工作区列表。
+    - `POST /workspace/initialize`: 手动触发工作区状态初始化。
+
+### 📦 API 目前测试可用：
+![img.png](img.png)
+---
+
+## [2025.12.04] 🚀 v0.1.0-beta（Pre-release）
 ### LightRAG-workspace · 单实例多租户架构首发版
 
 
