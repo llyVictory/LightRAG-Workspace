@@ -1618,8 +1618,6 @@ class LightRAG:
         # Get pipeline status shared data and lock
         # [修改] 优先从 Context 获取 workspace，如果没有则回退到 self.workspace
         current_workspace = get_current_workspace()
-        if not current_workspace:
-            current_workspace = self.workspace
 
         # Get pipeline status shared data and lock
         pipeline_status = await get_namespace_data(
@@ -2997,8 +2995,6 @@ class LightRAG:
         # Get pipeline status shared data and lock for validation
         # [修改] 优先从 Context 获取 workspace
         current_workspace = get_current_workspace()
-        if not current_workspace:
-            current_workspace = self.workspace
 
         # Get pipeline status shared data and lock for validation
         pipeline_status = await get_namespace_data(
