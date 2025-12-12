@@ -117,6 +117,8 @@ from lightrag.utils import (
 from lightrag.types import KnowledgeGraph
 from dotenv import load_dotenv
 
+from lightrag.context_utils import get_current_workspace
+
 # use the .env that is inside the current folder
 # allows to use different .env file for each lightrag instance
 # the OS environment variables take precedence over the .env file
@@ -1614,11 +1616,17 @@ class LightRAG:
         """
 
         # Get pipeline status shared data and lock
+        # [修改] 优先从 Context 获取 workspace，如果没有则回退到 self.workspace
+        current_workspace = get_current_workspace()
+        if not current_workspace:
+            current_workspace = self.workspace
+
+        # Get pipeline status shared data and lock
         pipeline_status = await get_namespace_data(
-            "pipeline_status", workspace=self.workspace
+            "pipeline_status", workspace=current_workspace # [修改] 使用动态 workspace
         )
         pipeline_status_lock = get_namespace_lock(
-            "pipeline_status", workspace=self.workspace
+            "pipeline_status", workspace=current_workspace # [修改] 使用动态 workspace
         )
 
         # Check if another process is already processing the queue
@@ -2987,11 +2995,17 @@ class LightRAG:
                 - `file_path` (str | None): The file path of the deleted document, if available.
         """
         # Get pipeline status shared data and lock for validation
+        # [修改] 优先从 Context 获取 workspace
+        current_workspace = get_current_workspace()
+        if not current_workspace:
+            current_workspace = self.workspace
+
+        # Get pipeline status shared data and lock for validation
         pipeline_status = await get_namespace_data(
-            "pipeline_status", workspace=self.workspace
+            "pipeline_status", workspace=current_workspace # [修改]
         )
         pipeline_status_lock = get_namespace_lock(
-            "pipeline_status", workspace=self.workspace
+            "pipeline_status", workspace=current_workspace # [修改]
         )
 
         # Track whether WE acquired the pipeline
